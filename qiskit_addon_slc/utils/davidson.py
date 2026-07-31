@@ -19,30 +19,29 @@
 from typing import cast
 
 import numpy as np
-import pyscf
 from qiskit.quantum_info import SparsePauliOp
+
+from .. import _davidson
 
 
 def get_extremal_eigenvalue(spo: SparsePauliOp, **kwargs) -> tuple[bool, float]:
     """Finds the extremal eigenvalue of the provided operator.
 
-    This converts the provided operator to a sparse matrix whose minimal eigenvalue is required.
+    The operator is converted to a sparse matrix, whose smallest eigenvalue is then computed by the
+    compiled Rust Davidson solver (a diagonally-preconditioned Davidson iteration).
 
     .. note::
         The current implementation is definitely not optimized in terms of performance.
 
     Args:
         spo: the operator whose minimal eigenvalue to find.
-        kwargs: additional keyword arguments for :func:`~pyscf.lib.linalg_helper.davidson1`. When
-            not specified otherwise, the following defaults will be used:
+        kwargs: additional keyword arguments for the Davidson algorithm. When not specified
+            otherwise, the following defaults will be used:
 
             * `tol`: 1e-6
             * `max_cycle`: 500
             * `max_space`: 12
             * `lindep`: 1e-11
-            * `max_memory`: 2000
-
-            Other values will default to PySCF's default values.
 
     Returns:
         A pair indicating whether the Davidson algorithm has converged and the obtained minimal
@@ -53,29 +52,30 @@ def get_extremal_eigenvalue(spo: SparsePauliOp, **kwargs) -> tuple[bool, float]:
         "max_cycle": 500,
         "max_space": 12,
         "lindep": 1e-11,
-        "max_memory": 2000,
     }
     default_kwargs.update(kwargs)
 
-    spmat = spo.to_matrix(sparse=True, force_serial=True)
+    spmat = spo.to_matrix(sparse=True, force_serial=True).tocsr()
+    dim = spmat.shape[0]
+    data = spmat.data.astype(np.complex128)
+    diag = spmat.diagonal().astype(np.complex128)
+    seed = _random_initial_guess((dim,)).astype(np.complex128)
 
-    x0 = [_random_initial_guess(spmat.shape)]
-
-    diag = spmat.diagonal()
-
-    def precond(dx, e, _):
-        x = diag - e
-        x[np.abs(x) < default_kwargs["tol"]] = default_kwargs["tol"]
-        return dx / x
-
-    converged, e, _ = pyscf.lib.davidson1(
-        lambda vecs: [spmat.dot(v) for v in vecs],
-        x0,
-        precond,
-        **default_kwargs,
+    return _davidson.davidson_smallest(
+        spmat.indptr.astype(np.int64),
+        spmat.indices.astype(np.int64),
+        np.ascontiguousarray(data.real),
+        np.ascontiguousarray(data.imag),
+        np.ascontiguousarray(diag.real),
+        np.ascontiguousarray(diag.imag),
+        np.ascontiguousarray(seed.real),
+        np.ascontiguousarray(seed.imag),
+        dim,
+        float(default_kwargs["tol"]),
+        int(default_kwargs["max_cycle"]),
+        int(default_kwargs["max_space"]),
+        float(default_kwargs["lindep"]),
     )
-
-    return converged, e[0]
 
 
 def _random_initial_guess(shape: tuple[int, ...]) -> np.ndarray:
