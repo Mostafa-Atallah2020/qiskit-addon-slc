@@ -26,6 +26,7 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install tox
         run: |
           python -m pip install --upgrade pip
