@@ -16,6 +16,7 @@
 
 """A basic Davidson solver."""
 
+import warnings
 from typing import cast
 
 import numpy as np
@@ -24,7 +25,15 @@ from qiskit.quantum_info import SparsePauliOp
 from .. import _accelerate
 
 
-def get_extremal_eigenvalue(spo: SparsePauliOp, **kwargs) -> tuple[bool, float]:
+def get_extremal_eigenvalue(
+    spo: SparsePauliOp,
+    *,
+    tol: float = 1e-6,
+    max_cycle: int = 500,
+    max_space: int = 12,
+    lindep: float = 1e-11,
+    **kwargs,
+) -> tuple[bool, float]:
     """Finds the extremal eigenvalue of the provided operator.
 
     The operator is converted to a sparse matrix, whose smallest eigenvalue is then computed by the
@@ -35,25 +44,23 @@ def get_extremal_eigenvalue(spo: SparsePauliOp, **kwargs) -> tuple[bool, float]:
 
     Args:
         spo: the operator whose minimal eigenvalue to find.
-        kwargs: additional keyword arguments for the Davidson algorithm. When not specified
-            otherwise, the following defaults will be used:
-
-            * `tol`: 1e-6
-            * `max_cycle`: 500
-            * `max_space`: 12
-            * `lindep`: 1e-11
+        tol: TODO.
+        max_cycle: TODO.
+        max_space: TODO.
+        lindep: TODO.
+        kwargs: **ignored!** Any additional keyword arguments are parsed for backwards compatibility
+            but do not have any effect at runtime and, thus, are being ignored!
 
     Returns:
         A pair indicating whether the Davidson algorithm has converged and the obtained minimal
         eigenvalue.
     """
-    default_kwargs = {
-        "tol": 1e-6,
-        "max_cycle": 500,
-        "max_space": 12,
-        "lindep": 1e-11,
-    }
-    default_kwargs.update(kwargs)
+    if len(kwargs) > 0:
+        warnings.warn(
+            f"These keyword arguments do not have any effect and are ignored: {kwargs}",
+            category=UserWarning,
+            stacklevel=2,
+        )
 
     spmat = spo.to_matrix(sparse=True, force_serial=True).tocsr()
     dim = spmat.shape[0]
@@ -71,10 +78,10 @@ def get_extremal_eigenvalue(spo: SparsePauliOp, **kwargs) -> tuple[bool, float]:
         np.ascontiguousarray(seed.real),
         np.ascontiguousarray(seed.imag),
         dim,
-        float(default_kwargs["tol"]),
-        int(default_kwargs["max_cycle"]),
-        int(default_kwargs["max_space"]),
-        float(default_kwargs["lindep"]),
+        float(tol),
+        int(max_cycle),
+        int(max_space),
+        float(lindep),
     )
 
 
