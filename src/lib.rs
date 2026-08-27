@@ -170,7 +170,7 @@ fn davidson_smallest(
 }
 
 #[pymodule]
-fn _davidson(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _accelerate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(davidson_smallest))?;
     Ok(())
 }

@@ -93,11 +93,12 @@ fail_under = 65
 show_missing = true
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
-locked = true
 bindings = "pyo3"
 python-source = "."
-module-name = "qiskit_addon_slc._davidson"
+features = ["pyo3/extension-module"]
+locked = true
+profile = "release"
+module-name = "qiskit_addon_slc._accelerate"
 
 [tool.mypy]
 python_version = "3.10"

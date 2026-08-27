@@ -21,7 +21,7 @@ from typing import cast
 import numpy as np
 from qiskit.quantum_info import SparsePauliOp
 
-from .. import _davidson
+from .. import _accelerate
 
 
 def get_extremal_eigenvalue(spo: SparsePauliOp, **kwargs) -> tuple[bool, float]:
@@ -61,7 +61,7 @@ def get_extremal_eigenvalue(spo: SparsePauliOp, **kwargs) -> tuple[bool, float]:
     diag = spmat.diagonal().astype(np.complex128)
     seed = _random_initial_guess((dim,)).astype(np.complex128)
 
-    return _davidson.davidson_smallest(
+    return _accelerate.davidson_smallest(
         spmat.indptr.astype(np.int64),
         spmat.indices.astype(np.int64),
         np.ascontiguousarray(data.real),
