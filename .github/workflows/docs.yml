@@ -32,6 +32,9 @@ jobs:
           pip install tox
           sudo apt-get update
           sudo apt-get install -y pandoc
+      - name: Build package
+        run: |
+          pip install -e .
       - name: Tell reno to name the upcoming release after the branch we are on
         shell: bash
         run: |
