@@ -10,7 +10,7 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""Type stubs for the compiled Rust extension ``qiskit_addon_slc._davidson``."""
+"""Type stubs for the compiled Rust extension ``qiskit_addon_slc._accelerate``."""
 
 import numpy as np
 import numpy.typing as npt
