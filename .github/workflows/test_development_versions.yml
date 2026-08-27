@@ -69,6 +69,9 @@ jobs:
           "qiskit-ibm-runtime @ file:$(echo qiskit-ibm-runtime/dist/*.whl)"
           "samplomatic @ file:$(echo samplomatic/dist/*.whl)"
           "qiskit-addon-utils @ file:$(echo qiskit-addon-utils/dist/*.whl)"
+      - name: Build package
+        run: |
+          pip install -e .
       - name: Test using tox environment
         run: |
           tox -e py --parallel --parallel-no-spinner
