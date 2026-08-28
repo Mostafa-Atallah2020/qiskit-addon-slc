@@ -12,13 +12,26 @@
 
 //! Davidson eigensolver for the algebraically smallest eigenvalue of a Hermitian sparse matrix.
 //!
-//! The dense linear algebra uses `nalgebra`. The sparse operator is held as a plain CSR triple and
-//! its matrix-vector product is applied directly, because `nalgebra-sparse` does not implement
+//! The dense linear algebra uses `nalgebra`, while the sparse operator is held as a plain CSR triple
+//! whose matrix-vector product is applied directly, because `nalgebra-sparse` does not implement
 //! sparse-times-dense multiplication for complex scalars.
+//!
+//! The stopping rule mirrors `pyscf.lib.davidson1`. A cycle converges when the Ritz value has settled
+//! (`|Δθ| < tol`) and the residual `A·x - θ·x` of the current Ritz pair `(θ, x)` has norm below
+//! `sqrt(tol)`. If the correction vanishes after orthogonalization the subspace is exhausted, and
+//! that same residual test then decides convergence, as in `davidson1` (`conv = dx_norm < toloose`).
+//!
+//! The Jacobi preconditioner divides each correction entry by the shift `diag[i] - θ`. A shift whose
+//! magnitude falls below `floor = 1e-12 * max(diag_scale, 1)`, where `diag_scale` is the largest
+//! `|diag[i]|`, is clamped up to `floor`, keeping its sign so it is not pushed the wrong way. This
+//! floor is relative to the operator scale rather than to `tol`, because `tol` is a residual
+//! threshold and clamping to it would corrupt operators with a near-zero diagonal. When the diagonal
+//! is entirely zero the preconditioner has no useful shift to apply, so it is skipped altogether.
 
 use nalgebra::{DMatrix, DVector};
 use num_complex::Complex64 as C64;
 use numpy::PyReadonlyArray1;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 /// A Hermitian operator held in compressed-sparse-row form.
@@ -62,6 +75,7 @@ fn columns_to_matrix(cols: &[DVector<C64>]) -> DMatrix<C64> {
     DMatrix::from_columns(&cols.iter().map(|c| c.column(0)).collect::<Vec<_>>())
 }
 
+/// Iterates for the algebraically smallest eigenvalue of `op`, returning `(converged, eigenvalue)`.
 fn davidson(
     op: &CsrOp,
     diag: &DVector<C64>,
@@ -72,6 +86,11 @@ fn davidson(
     lindep: f64,
 ) -> (bool, f64) {
     let dim = op.dim;
+
+    let diag_scale = diag.iter().map(|z| z.norm()).fold(0.0_f64, f64::max);
+    let precondition = diag_scale > 0.0;
+    let floor = 1e-12 * diag_scale.max(1.0);
+    let residual_tol = tol.sqrt();
 
     // Subspace basis vectors `s` and their images `A @ s`, grown one vector per cycle.
     let mut images: Vec<DVector<C64>> = vec![op.apply(&seed)];
@@ -95,20 +114,25 @@ fn davidson(
         let ritz_image = &images_mat * &y;
         let residual = &ritz_image - ritz.scale(theta);
 
-        if (eigval - prev).abs() < tol || residual.norm() < tol {
+        let residual_norm = residual.norm();
+        let de = (theta - prev).abs();
+        prev = theta;
+        if residual_norm < residual_tol && de < tol {
             converged = true;
             break;
         }
-        prev = eigval;
 
-        // Diagonal (Jacobi) preconditioner, clamping near-zero shifts to `tol`.
+        // Apply the preconditioner, flooring the shift while keeping its sign.
         let mut correction = residual;
-        for i in 0..dim {
-            let mut d = diag[i] - C64::new(theta, 0.0);
-            if d.norm() < tol {
-                d = C64::new(tol, 0.0);
+        if precondition {
+            for i in 0..dim {
+                let mut d = diag[i] - C64::new(theta, 0.0);
+                if d.norm() < floor {
+                    let sign = if d.re < 0.0 { -floor } else { floor };
+                    d = C64::new(sign, 0.0);
+                }
+                correction[i] /= d;
             }
-            correction[i] /= d;
         }
 
         // Collapse the subspace to the current best estimate before it exceeds `max_space`.
@@ -117,12 +141,13 @@ fn davidson(
             images = vec![ritz_image];
         }
 
-        // Orthonormalize the correction against the subspace (modified Gram-Schmidt).
+        // Classical Gram-Schmidt with one re-orthogonalization pass (numerically comparable to MGS).
         let s_mat = columns_to_matrix(&s);
+        correction -= &s_mat * (s_mat.adjoint() * &correction);
         correction -= &s_mat * (s_mat.adjoint() * &correction);
         let cnorm = correction.norm();
         if cnorm < lindep {
-            converged = true;
+            converged = residual_norm < residual_tol;
             break;
         }
         correction.unscale_mut(cnorm);
@@ -134,6 +159,9 @@ fn davidson(
     (converged, eigval)
 }
 
+/// Python entry point: builds a [`CsrOp`] from the split real/imaginary arrays and runs [`davidson`].
+///
+/// Raises `ValueError` if the CSR arrays, `dim`, `diag`, or `seed` are inconsistent.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn davidson_smallest(
@@ -155,15 +183,48 @@ fn davidson_smallest(
         re.iter().zip(im).map(|(a, b)| C64::new(*a, *b)).collect()
     }
 
+    let indptr = indptr.as_slice()?;
+    let indices = indices.as_slice()?;
+    let data = to_complex(data_re.as_slice()?, data_im.as_slice()?);
+    let diag = to_complex(diag_re.as_slice()?, diag_im.as_slice()?);
+    let seed = to_complex(seed_re.as_slice()?, seed_im.as_slice()?);
+
+    if dim == 0 {
+        return Err(PyValueError::new_err("`dim` must be positive"));
+    }
+    if max_space < 2 {
+        return Err(PyValueError::new_err("`max_space` must be at least 2"));
+    }
+    if indptr.len() != dim + 1 {
+        return Err(PyValueError::new_err("`indptr` must have length `dim + 1`"));
+    }
+    if !indptr.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(PyValueError::new_err("`indptr` must be non-decreasing"));
+    }
+    if indptr[dim] as usize != indices.len() || indices.len() != data.len() {
+        return Err(PyValueError::new_err(
+            "`indptr[dim]` must equal `indices.len()` and `data.len()`",
+        ));
+    }
+    if indices.iter().any(|&j| j < 0 || j as usize >= dim) {
+        return Err(PyValueError::new_err(
+            "`indices` entries must be in `[0, dim)`",
+        ));
+    }
+    if diag.len() != dim || seed.len() != dim {
+        return Err(PyValueError::new_err(
+            "`diag` and `seed` must have length `dim`",
+        ));
+    }
+
     let op = CsrOp {
-        indptr: indptr.as_slice()?.to_vec(),
-        indices: indices.as_slice()?.to_vec(),
-        data: to_complex(data_re.as_slice()?, data_im.as_slice()?),
+        indptr: indptr.to_vec(),
+        indices: indices.to_vec(),
+        data,
         dim,
     };
-
-    let diag = DVector::from_vec(to_complex(diag_re.as_slice()?, diag_im.as_slice()?));
-    let seed = DVector::from_vec(to_complex(seed_re.as_slice()?, seed_im.as_slice()?));
+    let diag = DVector::from_vec(diag);
+    let seed = DVector::from_vec(seed);
 
     let (conv, ev) = davidson(&op, &diag, seed, tol, max_cycle, max_space, lindep);
     Ok((conv, ev))
