@@ -66,7 +66,7 @@ def get_extremal_eigenvalue(
     dim = spmat.shape[0]
     data = spmat.data.astype(np.complex128)
     diag = spmat.diagonal().astype(np.complex128)
-    seed = _random_initial_guess((dim,)).astype(np.complex128)
+    seed = _initial_guess((dim,)).astype(np.complex128)
 
     return _accelerate.davidson_smallest(
         spmat.indptr.astype(np.int64),
@@ -85,20 +85,26 @@ def get_extremal_eigenvalue(
     )
 
 
-def _random_initial_guess(shape: tuple[int, ...]) -> np.ndarray:
-    """Produces a random array of the requested shape.
+def _initial_guess(shape: tuple[int, ...]) -> np.ndarray:
+    """Produces a deterministic normalized starting vector of the requested shape.
+
+    A fixed-seed local generator is used so that the
+    Davidson iteration is reproducible: the same operator always yields the same result, independent
+    of any surrounding random state. A pseudo-random (rather than constant) vector is used to avoid
+    initial guesses that are accidentally orthogonal to the target eigenvector.
 
     Args:
         shape: the requested shape.
 
     Returns:
-        An array of random complex values with their real and imaginary parts lying in the interval
+        A unit-norm array of complex values with their real and imaginary parts lying in the interval
         ``[0, 1)``.
     """
-    norm = 0.0
+    rng = np.random.default_rng(0)
 
+    norm = 0.0
     while norm == 0:
-        x = np.random.rand(shape[0]) + 1.0j * np.random.rand(shape[0])
+        x = rng.random(shape[0]) + 1.0j * rng.random(shape[0])
         norm = cast(float, np.linalg.norm(x))
 
     return x / norm
