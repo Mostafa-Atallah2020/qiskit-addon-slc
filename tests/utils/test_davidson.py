@@ -15,8 +15,15 @@
 from __future__ import annotations
 
 import numpy as np
-from qiskit.quantum_info import SparsePauliOp
+import pytest
+import qiskit_addon_slc.utils.davidson as davidson
+from qiskit.quantum_info import PauliList, SparsePauliOp
 from qiskit_addon_slc.utils.davidson import get_extremal_eigenvalue
+
+
+def _dense_min(spo: SparsePauliOp) -> float:
+    """Most-negative eigenvalue computed by brute-force dense diagonalization."""
+    return float(np.linalg.eigvalsh(spo.to_matrix())[0])
 
 
 def test_davidson() -> None:
@@ -27,3 +34,51 @@ def test_davidson() -> None:
     converged, eigval = get_extremal_eigenvalue(spo, tol=1e-5)
     assert converged
     assert np.isclose(eigval, -1.57317)
+
+
+DENSE_OPERATORS = {
+    "single_pauli": SparsePauliOp(["XYZ"], [1.3]),
+    "diagonal": SparsePauliOp(["ZZI", "IZZ", "ZIZ", "IIZ"], [0.5, -1.2, 0.3, 0.9]),
+    "one_pair_plus_central": SparsePauliOp(["XI", "ZI", "IZ"], [0.7, -0.4, 1.1]),
+    "mixed": SparsePauliOp(["XII", "ZII", "IXX", "IZZ", "IYI"], [1.0, 0.5, -0.3, 0.8, 0.6]),
+    # Positive-definite: a large identity term shifts the whole spectrum above zero, so the
+    # per-sector minimum must not be clamped at 0.0.
+    "positive_definite": SparsePauliOp(["XI", "ZI", "II"], [0.5, 0.5, 3.0]),
+    # Positive-definite and fully commuting -> takes the p == 0 diagonal path.
+    "positive_definite_diagonal": SparsePauliOp(["ZI", "IZ", "II"], [0.5, 0.25, 2.0]),
+    # Multiples of the identity reduce to a 0-qubit operator; its single eigenvalue is the sum of
+    # the coefficients, which must survive the reduction.
+    "identity_only": SparsePauliOp(["II"], [-0.73]),
+    "identity_only_unsimplified": SparsePauliOp(["II", "II"], [-0.5, -0.23]),
+    "identity_only_positive": SparsePauliOp(["III"], [2.5]),
+}
+
+
+@pytest.mark.parametrize("name", list(DENSE_OPERATORS))
+def test_exact_paths_match_dense(name: str) -> None:
+    """The exact paths (``p == 0`` diagonal and dense per-sector) are exact and always converge."""
+    spo = DENSE_OPERATORS[name]
+    converged, eigval = get_extremal_eigenvalue(spo)
+    assert converged
+    assert np.isclose(eigval, _dense_min(spo), atol=1e-10)
+
+
+def test_iterative_path_matches_dense(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the iterative fallback (via a low cutoff) and check it matches dense diagonalization."""
+    monkeypatch.setattr(davidson, "_MAX_REDUCED_LOG2_DIM", 1)
+    np.random.seed(0)  # the Davidson initial guess is random
+    # p = 1 (X0, Z0 anticommute), c = 2 (IXX, IZZ central) -> p + c = 3 > cutoff -> iterative.
+    spo = SparsePauliOp(["XII", "ZII", "IXX", "IZZ"], [1.0, 0.5, -0.3, 0.8])
+    converged, eigval = get_extremal_eigenvalue(spo, tol=1e-10)
+    assert converged
+    assert np.isclose(eigval, _dense_min(spo), atol=1e-6)
+
+
+def test_large_diagonal_matches_dense() -> None:
+    """A many-qubit fully-commuting (p == 0) operator takes the diagonal path and stays exact."""
+    rng = np.random.default_rng(0)
+    z = rng.integers(0, 2, (40, 10), dtype=bool)  # Z-only Paulis -> diagonal, 10 > cutoff
+    spo = SparsePauliOp(PauliList.from_symplectic(z, np.zeros_like(z)), rng.standard_normal(40))
+    converged, eigval = get_extremal_eigenvalue(spo)
+    assert converged
+    assert np.isclose(eigval, _dense_min(spo), atol=1e-10)
