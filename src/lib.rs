@@ -17,9 +17,12 @@
 //! sparse-times-dense multiplication for complex scalars.
 //!
 //! The stopping rule mirrors `pyscf.lib.davidson1`. A cycle converges when the Ritz value has settled
-//! (`|Δθ| < tol`) and the residual `A·x - θ·x` of the current Ritz pair `(θ, x)` has norm below
-//! `sqrt(tol)`. If the correction vanishes after orthogonalization the subspace is exhausted, and
-//! that same residual test then decides convergence, as in `davidson1` (`conv = dx_norm < toloose`).
+//! (`|Δθ| < tol`) and the residual `A·x - θ·x` of the current Ritz pair `(θ, x)` has norm below the
+//! gate `max(tol, 64·ε·max(‖A‖, 1))`. The `ε‖A‖` term keeps the gate reachable at a tiny `tol`, since
+//! a converged eigenvector still leaves a residual on that order, while the `tol` term keeps accuracy
+//! tracking the request when `tol` dominates. `‖A‖` is estimated by the maximum absolute row sum. If
+//! the correction vanishes after orthogonalization the subspace is exhausted, and that same residual
+//! test then decides convergence, as in `davidson1` (`conv = dx_norm < toloose`).
 //!
 //! The Jacobi preconditioner divides each correction entry by the shift `diag[i] - θ`. A shift whose
 //! magnitude falls below `floor = 1e-12 * max(diag_scale, 1)`, where `diag_scale` is the largest
@@ -54,6 +57,18 @@ impl CsrOp {
             y[row] = acc;
         }
         y
+    }
+
+    /// Maximum absolute row sum, the induced infinity-norm, which for a Hermitian operator upper
+    /// bounds the spectral radius. Used as a cheap operator-scale estimate.
+    fn norm_bound(&self) -> f64 {
+        (0..self.dim)
+            .map(|row| {
+                (self.indptr[row] as usize..self.indptr[row + 1] as usize)
+                    .map(|k| self.data[k].norm())
+                    .sum::<f64>()
+            })
+            .fold(0.0_f64, f64::max)
     }
 }
 
@@ -90,7 +105,10 @@ fn davidson(
     let diag_scale = diag.iter().map(|z| z.norm()).fold(0.0_f64, f64::max);
     let precondition = diag_scale > 0.0;
     let floor = 1e-12 * diag_scale.max(1.0);
-    let residual_tol = tol.sqrt();
+
+    // Residual gate relative to the operator scale (see the module documentation).
+    let anorm = op.norm_bound();
+    let residual_tol = tol.max(64.0 * f64::EPSILON * anorm.max(1.0));
 
     // Subspace basis vectors `s` and their images `A @ s`, grown one vector per cycle.
     let mut images: Vec<DVector<C64>> = vec![op.apply(&seed)];
