@@ -20,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Physics",
 ]
 
@@ -27,6 +28,7 @@ requires-python = ">=3.10"
 
 dependencies = [
     "matplotlib>=3.10.5, <4",
+    "plotly>=6.5.0, <8",
     "qiskit[visualization]>=2.2, <3",
     "pauli-prop>=0.1.0, <1",
     "rustworkx",
@@ -45,32 +47,32 @@ basetest = [
 ]
 test = [
     "qiskit-addon-slc[basetest]",
-    "qiskit-ibm-runtime>=0.46",
+    "qiskit-ibm-runtime>=0.47",
 ]
 doctest = [
     "qiskit-addon-slc[basetest,notebook-dependencies]",
-    "pytest-doctestplus>=1.2.1",
+    "pytest-doctestplus>=1.3.0",
 ]
 nbtest = [
     "qiskit-addon-slc[basetest]",
     "nbmake>=1.5.0",
 ]
 style = [
-    "ruff==0.16.4",
+    "ruff==0.16.10",
     "nbqa>=1.8.5",
     "typos>=1.20.0",
 ]
 lint = [
     "qiskit-addon-slc[style]",
-    "mypy==2.3.1",
-    "pylint==4.0.7",
+    "mypy==2.4.0",
+    "pylint==4.1.2",
     "reno>=4.1",
     "toml>=0.9.6",
 ]
 notebook-dependencies = [
     "qiskit-addon-slc",
     "qiskit-addon-utils>=0.3.0",
-    "qiskit-ibm-runtime>=0.46",
+    "qiskit-ibm-runtime>=0.47",
 ]
 docs = [
     "qiskit-addon-slc[doctest]",
@@ -99,6 +101,44 @@ features = ["pyo3/extension-module"]
 locked = true
 profile = "release"
 module-name = "qiskit_addon_slc._accelerate"
+
+# The extension is built abi3 (`pyo3`'s `abi3-py310` feature in `Cargo.toml`), so cibuildwheel
+# collapses each platform down to a single `cp310-abi3` wheel, which it then tests under every
+# supported Python.
+[tool.cibuildwheel]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+build = ["cp3??-*"]
+skip = [
+    "cp315-*",  # not yet supported
+    "*-win32",
+    "*_i686",
+    "*_universal2",
+    "*-musllinux_*",
+]
+test-extras = ["test"]
+# `--import-mode=importlib` because `tests/` is a package: in the default `prepend` mode pytest puts
+# the source checkout on `sys.path`, and its `qiskit_addon_slc/` (which has no compiled extension)
+# then shadows the installed wheel. Passing the test path explicitly also makes pytest ignore
+# `[tool.pytest.ini_options].testpaths`, so the doctests under `qiskit_addon_slc/` are not collected
+# (`-p no:doctest`); those stay owned by `test_latest_versions.yml`.
+test-command = "python -m pytest --import-mode=importlib -p no:doctest {project}/tests"
+environment = 'RUSTUP_TOOLCHAIN="stable"'
+
+[tool.cibuildwheel.linux]
+# The manylinux containers do not have Rust.
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+environment = 'PATH="$PATH:$HOME/.cargo/bin" CARGO_NET_GIT_FETCH_WITH_CLI="true" RUSTUP_TOOLCHAIN="stable"'
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} && pipx run abi3audit --strict --report {wheel}"
+
+[tool.cibuildwheel.macos]
+# A single floor for both architectures: `rustc` raises it to 11.0 for `aarch64-apple-darwin` on its
+# own, and 10.12 is `rustc`'s own default for `x86_64-apple-darwin`.
+environment = "MACOSX_DEPLOYMENT_TARGET='10.12' RUSTUP_TOOLCHAIN=stable"
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} && pipx run abi3audit --strict --report {wheel}"
+
+[tool.cibuildwheel.windows]
+repair-wheel-command = "cp {wheel} {dest_dir}/. && pipx run abi3audit --strict --report {wheel}"
 
 [tool.mypy]
 python_version = "3.10"

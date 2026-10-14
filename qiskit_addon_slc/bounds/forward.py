@@ -39,11 +39,21 @@ from qiskit.utils import deprecate_arg
 
 from .. import globals as slc_globals
 from ..utils import get_extremal_eigenvalue, remove_measure
-from .commutator_bounds import Bounds, CommutatorBounds, compute_bounds
+from .commutator_bounds import (
+    _DEFAULT_EVOLUTION_MAX_TERMS,
+    Bounds,
+    CommutatorBounds,
+    compute_bounds,
+)
 from .light_cone import LightCone
 
 LOGGER = logging.getLogger(__name__)
 WARNING_TOL: float = 1e-8
+
+# The default width, in qubits, beyond which a commutator's spectral norm is no longer computed and
+# the triangle inequality is used instead. Shared by :func:`time_evolved_norm_forward` and
+# :func:`compute_forward_bounds` so that bounding a single term agrees with bounding a whole circuit.
+_DEFAULT_EIGVAL_MAX_QUBITS: int = 14
 
 
 def time_evolved_norm_forward(
@@ -51,8 +61,8 @@ def time_evolved_norm_forward(
     gates: RotationGates,
     observable: Pauli,
     *,
-    evolution_max_terms: int = np.iinfo(np.uint).max,
-    eigval_max_qubits: int = np.iinfo(np.uint).max,
+    evolution_max_terms: int = _DEFAULT_EVOLUTION_MAX_TERMS,
+    eigval_max_qubits: int = _DEFAULT_EIGVAL_MAX_QUBITS,
     comm_norm_order: int = 2,
     atol_simplify: float = 1e-8,
     atol_eigenvalue: float = 1e-10,
@@ -214,8 +224,8 @@ def compute_forward_bounds(
     /,
     observable: Pauli | PauliList | SparseObservable | SparsePauliOp,
     *,
-    evolution_max_terms: int = 1_000_000,
-    eigval_max_qubits: int = 14,
+    evolution_max_terms: int = _DEFAULT_EVOLUTION_MAX_TERMS,
+    eigval_max_qubits: int = _DEFAULT_EIGVAL_MAX_QUBITS,
     atol: float = 1e-8,
     atol_simplify: float = 1e-8,
     atol_eigenvalue: float = 1e-10,
@@ -234,6 +244,13 @@ def compute_forward_bounds(
     corresponding terms will be used whenever a :class:`~qiskit.circuit.BoxOp` with a matching
     :class:`~samplomatic.InjectNoise` annotation is encountered during the iteration over
     ``circuit``.
+
+    .. important::
+      Every :class:`~qiskit.circuit.BoxOp` with an :class:`~samplomatic.InjectNoise` annotation
+      **must** have a unique ``modifier_ref``, since the bounds are keyed by it. Boxing a circuit
+      with :func:`~samplomatic.transpiler.generate_boxing_pass_manager` provides this only with
+      ``inject_noise_strategy="individual_modification"``. Otherwise, the bounds of boxes sharing a
+      ``modifier_ref`` silently overwrite each other.
 
     Args:
         circuit: the target circuit.

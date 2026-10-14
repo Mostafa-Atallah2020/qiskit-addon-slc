@@ -1,37 +1,67 @@
 # GitHub Actions workflows
 
-This directory contains a number of workflows for use with [GitHub Actions](https://docs.github.com/actions).  They specify what standards should be expected for development of this software, including pull requests.  These workflows are designed to work out of the box for any research software prototype, especially those based on [Qiskit](https://qiskit.org/).
+This directory contains the workflows for use with [GitHub Actions](https://docs.github.com/actions).  They specify what standards should be expected for development of this software, including pull requests.
 
-## Lint check (`lint.yml`)
+## Structure
 
-This workflow checks that the code is formatted properly and follows the style guide by installing tox and running the [lint environment](/tests/#lint-environment) (`tox -e lint`).
+Most workflows here are _reusable_: they only have a `workflow_call` trigger and are driven by a small number of callers that own the triggers and the `concurrency` settings.
 
-## Latest version tests (`test_latest_versions.yml`)
+- **`config.yml`** centralizes shared values (supported Python versions, runner images, the current release branch).  Every caller reads them as `needs.config.outputs.<name>`, so changing e.g. the supported Python versions is a single edit there.
+- **`branch-protection.yml`** runs on pull requests (and the merge queue, once enabled) and calls every required check.  Its `Finalize` job depends on all of them, so the repository ruleset only needs to require that one check.  Adding, removing or renaming a CI job is therefore a pure code change.
+- **`on-nightly.yml`** runs the same test suites once per day.  This is the main post-merge safety net and is what catches breakage from new upstream releases or commits when no pull request is open.
 
-This workflow installs the latest version of tox and runs [the current repository's tests](/tests/#test-py-environments) under each supported Python version on Linux and under a single Python version on macOS.  This is the primary testing workflow.  It runs for all code changes and additionally once per day, to ensure tests continue to pass as new versions of dependencies are released.
+Most jobs are guarded by `github.repository_owner == 'Qiskit'`, so they skip on forks.
 
-## Development version tests (`test_development_versions.yml`)
+The package contains a Rust extension (`qiskit_addon_slc._accelerate`, built by [maturin](https://www.maturin.rs/)), so every job that installs it first installs a stable Rust toolchain and restores the cargo registry cache, keyed on `Cargo.lock`.  The test, coverage and documentation jobs also run `pip install --no-deps -e .` before tox: pytest (for the doctests under `qiskit_addon_slc/`) and Sphinx's autodoc import the package from the source tree, which shadows the wheel that tox installs, and the editable install puts the compiled extension into that tree.
 
-This workflow installs tox and modifies `pyproject.toml` to use the _development_ versions of certain Qiskit packages, using [extremal-python-dependencies](https://github.com/IBM/extremal-python-dependencies).  For all other packages, the latest version is installed.  This workflow runs on two versions of Python: the minimum supported version and the maximum supported version.  Its purpose is to identify as soon as possible (i.e., before a Qiskit release) when changes in Qiskit will break the current repository.  This workflow runs for all code changes, as well as on a timer once per day.
+## Required checks (called by `branch-protection.yml`)
 
-## Minimum version tests (`test_minimum_versions.yml`)
+### Lint check (`lint.yml`)
 
-This workflow first installs the minimum supported tox version (the `minversion` specified in [`tox.ini`](/tox.ini)) and then installs the _minimum_ compatible version of each package listed in `pyproject.toml`, using [extremal-python-dependencies](https://github.com/IBM/extremal-python-dependencies).  The purpose of this workflow is to make sure the minimum version specifiers in these files are accurate, i.e., that the tests actually pass with these versions.  This workflow uses a single Python version, typically the oldest supported version, as the minimum supported versions of each package may not be compatible with the most recent Python release.
+Checks that the code is formatted properly and follows the style guide by running the [lint environment](/tests/#lint-environment) (`tox -e lint`).  The Rust code is checked with `cargo fmt --check` and `cargo clippy -D warnings`.
 
-Under the hood, this workflow uses a regular expression to change each `>=` and `~=` specifier in the dependencies to instead be `==`, as pip [does not support](https://github.com/pypa/pip/issues/8085) resolving the minimum versions of packages directly.  Unfortunately, this means that the workflow will only install the minimum version of a package if it is _explicitly_ listed in one of the requirements files with a minimum version.  For instance, if the only listed dependency is `qiskit>=1.0`, this workflow will install `qiskit==1.0` along with the latest version of each transitive dependency, such as `rustworkx`.
+### Documentation (`docs.yml`)
 
-## Code coverage (`coverage.yml`)
+Ensures that the [Sphinx](https://www.sphinx-doc.org/) documentation builds successfully (`tox -e docs`), and uploads the result as the `qiskit-addon-slc-htmldocs` artifact so that it can be downloaded and browsed.  It only builds; publishing is done by `docs_deploy.yml`.
 
-This workflow tests the [coverage environment](/tests/#coverage-environment) on a single version of Python by installing tox and running `tox -e coverage`.
+### Latest version tests (`test_latest_versions.yml`)
 
-## Documentation (`docs.yml`)
+Runs [the current repository's tests](/tests/#test-py-environments), doctests and notebook tests against the latest version of each dependency, under each supported Python version on Linux and under the newest one on macOS and Windows.  This is the primary testing workflow.
 
-This workflow ensures that the [Sphinx](https://www.sphinx-doc.org/) documentation builds successfully.  It also publishes the resulting build to [GitHub Pages](https://pages.github.com/) if it is from the appropriate branch (e.g., `main`).
+### Development version tests (`test_development_versions.yml`)
 
-## Citation preview (`citation.yml`)
+Modifies `pyproject.toml` to use the _development_ versions of certain Qiskit packages, using [extremal-python-dependencies](https://github.com/IBM/extremal-python-dependencies).  For all other packages, the latest version is installed.  This runs on the oldest and the newest supported Python version.  Its purpose is to identify as soon as possible (i.e., before a Qiskit release) when changes upstream will break the current repository.
 
-This workflow is only triggered when the `CITATION.bib` file is changed.  It ensures that the file contains only ASCII characters ([escaped codes](https://en.wikibooks.org/wiki/LaTeX/Special_Characters#Escaped_codes) are preferred, as then the `bib` file will work even when `inputenc` is not used).  It also compiles a sample LaTeX document which includes the citation in its bibliography and uploads the resulting PDF as an artifact so it can be previewed (e.g., before merging a pull request).
+### Minimum version tests (`test_minimum_versions.yml`)
 
-## Release (`release.yml`)
+Installs the minimum supported tox version (the `minversion` specified in [`tox.ini`](/tox.ini)) and then the _minimum_ compatible version of each package listed in `pyproject.toml`, using [extremal-python-dependencies](https://github.com/IBM/extremal-python-dependencies).  The purpose of this workflow is to make sure the minimum version specifiers are accurate, i.e., that the tests actually pass with these versions.  It uses the oldest supported Python version, as the minimum supported versions of each package may not be compatible with the most recent Python release.
 
-This workflow is triggered by a maintainer pushing a tag that represents a release.  It publishes the release to github.com and to [PyPI](https://pypi.org/).
+Under the hood, this uses a regular expression to change each `>=` and `~=` specifier in the dependencies to instead be `==`, as pip [does not support](https://github.com/pypa/pip/issues/8085) resolving the minimum versions of packages directly.  Unfortunately, this means that the workflow will only install the minimum version of a package if it is _explicitly_ listed with a minimum version.  For instance, if the only listed dependency is `qiskit>=1.0`, this workflow will install `qiskit==1.0` along with the latest version of each transitive dependency, such as `rustworkx`.
+
+## Other workflows
+
+### Code coverage (`coverage.yml`)
+
+Runs the [coverage environment](/tests/#coverage-environment) (`tox -e coverage`) and uploads the report to [Coveralls](https://coveralls.io/).  It runs on pull requests and on every push to `main` and `stable/**`.  It is deliberately not a required check: coverage is a metric rather than a correctness property, and a Coveralls outage should not block merging.
+
+### Documentation deployment (`docs_deploy.yml`)
+
+Runs on pushes to `main`, `stable/**` and release tags.  It builds the documentation via `docs.yml` and, for the current release branch (`stable-branch` in `config.yml`), publishes it to [GitHub Pages](https://pages.github.com/).
+
+### Citation preview (`citation.yml`)
+
+Only triggered when the `CITATION.bib` file is changed.  It ensures that the file contains only ASCII characters ([escaped codes](https://en.wikibooks.org/wiki/LaTeX/Special_Characters#Escaped_codes) are preferred, as then the `bib` file will work even when `inputenc` is not used).  It also compiles a sample LaTeX document which includes the citation in its bibliography and uploads the resulting PDF as an artifact so it can be previewed.
+
+### Backport metadata (`backport.yml`)
+
+Backports are opened by [Mergify](https://mergify.com/) for pull requests labeled `stable backport potential` (see [`.mergify.yml`](/.mergify.yml)).  This workflow copies the labels and milestone of the original pull request onto the backport.
+
+### Wheel builds (`wheels-build.yml`, `wheels-pr.yml`)
+
+`wheels-build.yml` is a reusable workflow that builds the sdist and, with [cibuildwheel](https://cibuildwheel.pypa.io/), the binary wheels for Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows (x86_64).  The extension targets the stable ABI (`abi3-py310`), so each platform yields a single `cp310-abi3` wheel, which cibuildwheel tests under every supported Python.  Its configuration lives in `[tool.cibuildwheel]` in `pyproject.toml`.
+
+`wheels-pr.yml` runs it on a pull request labeled `ci: test wheels`, to check the wheel builds before a release.
+
+### Release (`release.yml`)
+
+Triggered by a maintainer pushing a version-shaped tag (e.g. `0.2.0` or `0.2.0rc1`).  It builds the sdist and wheels once via `wheels-build.yml`, attaches them to a new GitHub release (marked as a pre-release when the tag has a pre-release suffix) and publishes them to [PyPI](https://pypi.org/).

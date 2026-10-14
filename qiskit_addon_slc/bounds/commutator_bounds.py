@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
+import threading
 import time
+from collections import Counter
 from collections.abc import Callable
 from functools import partial
 from typing import NamedTuple
@@ -47,6 +50,28 @@ from .light_cone import LightCone
 Bounds = dict[str, PauliLindbladMap]
 
 LOGGER = logging.getLogger(__name__)
+
+# The default cap on the number of operator terms tracked during a Pauli evolution.
+#
+# This must stay a realistic number rather than something nominally "unlimited" such as
+# ``np.iinfo(np.uint).max``: :func:`~pauli_prop.propagation.propagate_through_rotation_gates` treats
+# the cap as a *capacity* and pre-allocates it, so a value of that size asks the allocator for
+# terabytes and aborts the process rather than raising.
+_DEFAULT_EVOLUTION_MAX_TERMS: int = 1_000_000
+
+
+def _forbid_qiskit_parallelism() -> None:
+    """Makes Qiskit's Rust code run serially in a worker process.
+
+    Qiskit runs some of its Rust routines, such as :meth:`.SparsePauliOp.to_matrix`, on a global
+    ``rayon`` thread pool, which is started the first time one of them is called. A worker forked
+    from a process that has already started that pool inherits the pool's state but none of its
+    threads, so the first such call in the worker waits forever for threads that do not exist.
+
+    This is the same guard :func:`qiskit.utils.parallel_map` installs in its own workers: it tells
+    Qiskit that it is already running in parallel, so the Rust code does not reach for the pool.
+    """
+    os.environ["QISKIT_IN_PARALLEL"] = "TRUE"
 
 
 class CommutatorBounds(NamedTuple):
@@ -107,6 +132,15 @@ def compute_bounds(
     the light-cone of the observable (initialized by ``light_cone``). These computed bounds form the
     basis of the shaded light-cone.
 
+    .. important::
+      The computed bounds are keyed by ``InjectNoise.modifier_ref``, so every
+      :class:`.BoxOp` with an :class:`.InjectNoise` annotation **must** have a unique
+      ``modifier_ref``. Boxing a circuit with
+      :func:`~samplomatic.transpiler.generate_boxing_pass_manager` provides this only with
+      ``inject_noise_strategy="individual_modification"``. With any other strategy, several boxes
+      share a ``modifier_ref``, which leads to silently wrong forward bounds or a backward
+      computation that never finishes.
+
     Since this function performs a long-running computation, it gracefully handles
     ``KeyboardInterrupt`` exceptions, allowing the user to interrupt the computation at an arbitrary
     point in time and still obtain the results that have been computed up to that point.
@@ -115,7 +149,9 @@ def compute_bounds(
         circuit: the target circuit.
         noise_model_paulis: the Pauli error terms to consider for each noise model.
         light_cone: the initialized and stateful :class:`.LightCone` tracker.
-        norm_fn: the function implementing the specific unequal time commutator.
+        norm_fn: the function implementing the specific unequal time commutator. It gets called
+            as ``norm_fn(pauli, gates)`` for every Pauli error term, where ``gates`` are the
+            non-Clifford gates within the light-cone that the error term must be evolved through.
         backwards: whether to iterate over the ``circuit`` in reverse.
         max_num_boxes: the maximum number of boxes for which to compute bounds. Bounds for any
             additional boxes will be given the trivial upper bound value of :math:`2.0`.
@@ -173,7 +209,32 @@ def compute_bounds(
 
         gathered_bounds[box_id][0][rate_idx] = bound.min()
 
-    pool = mp.Pool(num_processes)
+    failures: list[BaseException] = []
+    # NOTE: the pool calls _record_failure from two threads: the one handling the results of the
+    # tasks, and the one sending the tasks to the workers (if sending a task fails)
+    failures_lock = threading.Lock()
+
+    def _record_failure(exc: BaseException, box_id: str, rate_idx: int) -> None:
+        """Records a task that raised an exception, leaving the trivial bound for its error term.
+
+        Every failure gets recorded, but only the first one gets logged on its own, together with its
+        traceback, since all others are likely to share the same cause. Once the computation has
+        finished, a single warning summarizes all recorded failures.
+        """
+        nonlocal failures
+
+        with failures_lock:
+            is_first = not failures
+            failures.append(exc)
+        if is_first:
+            # NOTE: the exception's cause holds the traceback from within the worker process
+            LOGGER.warning(
+                f"Computing the bound of error term {rate_idx} of box '{box_id}' failed. Its error "
+                "term keeps the trivial bound of 2.0, as does that of any other failing task.",
+                exc_info=exc,
+            )
+
+    pool = mp.Pool(num_processes, initializer=_forbid_qiskit_parallelism)
     tasks = set()
 
     start = time.time()
@@ -219,18 +280,14 @@ def compute_bounds(
             circuit.num_qubits,
         )
 
-        norm_fn = partial(  # type: ignore[call-arg]
-            norm_fn,
-            gates=RotationGates(
-                rot_gates.gates[::-1], rot_gates.qargs[::-1], rot_gates.thetas[::-1]
-            ),
-        )
+        gates = RotationGates(rot_gates.gates[::-1], rot_gates.qargs[::-1], rot_gates.thetas[::-1])
 
         for pauli_idx, pauli in enumerate(local_noise_terms.to_pauli_list()):
             task = pool.apply_async(
                 norm_fn,
-                [pauli],
+                [pauli, gates],
                 callback=partial(_insert_rate, box_id=box_id, rate_idx=pauli_idx),
+                error_callback=partial(_record_failure, box_id=box_id, rate_idx=pauli_idx),
             )
             tasks.add(task)
 
@@ -269,9 +326,17 @@ def compute_bounds(
 
     tasks = {t for t in tasks if not t.ready()}
     completed = total_num_tasks - len(tasks)
-    LOGGER.info(f"Successfully completed [{completed}/{total_num_tasks}] tasks!")
 
     pool.join()
+
+    LOGGER.info(f"Successfully completed [{completed - len(failures)}/{total_num_tasks}] tasks!")
+    if failures:
+        failure_types = Counter(type(exc).__name__ for exc in failures)
+        LOGGER.warning(
+            f"[{len(failures)}/{total_num_tasks}] tasks failed and their error terms kept the "
+            "trivial bound of 2.0: "
+            + ", ".join(f"{count} x {name}" for name, count in failure_types.most_common())
+        )
 
     comm_norms: Bounds = {
         box_id: PauliLindbladMap.from_components(bounds[0], bounds[1])

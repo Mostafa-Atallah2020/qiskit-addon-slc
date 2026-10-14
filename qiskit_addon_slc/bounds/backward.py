@@ -35,17 +35,22 @@ from qiskit.quantum_info import (
 
 from .. import globals as slc_globals
 from ..utils import remove_measure
-from .commutator_bounds import Bounds, CommutatorBounds, compute_bounds
+from .commutator_bounds import (
+    _DEFAULT_EVOLUTION_MAX_TERMS,
+    Bounds,
+    CommutatorBounds,
+    compute_bounds,
+)
 from .light_cone import LightCone
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _time_evolved_norm_backward(
+def time_evolved_norm_backward(
     pauli: Pauli,
     gates: RotationGates,
     *,
-    evolution_max_terms: int = np.iinfo(np.uint).max,
+    evolution_max_terms: int = _DEFAULT_EVOLUTION_MAX_TERMS,
 ) -> CommutatorBounds:
     r"""Bound the effect of an error Pauli term on the quantum state by evolving the error backward.
 
@@ -57,6 +62,9 @@ def _time_evolved_norm_backward(
     target circuit) is evolved backwards to the *start* of the circuit. In doing so, it must
     be evolved through the non-Clifford component of the circuit within the light-cone (here, given
     by ``gates``).
+
+    The state is assumed to be the all-zero state, :math:`\ket{0 \ldots 0}`, which is what
+    :func:`.compute_backward_bounds` assumes for every active qubit of the circuit.
 
     Note, that this function is designed for the context of :func:`.compute_backward_bounds` which
     inverts the target circuit first. Hence, a backward evolution actually amounts to the
@@ -106,7 +114,7 @@ def compute_backward_bounds(
     noise_model_paulis: dict[str, QubitSparsePauliList],
     /,
     *,
-    evolution_max_terms: int = 1_000_000,
+    evolution_max_terms: int = _DEFAULT_EVOLUTION_MAX_TERMS,
     **kwargs,
 ) -> Bounds:
     r"""Compute the backward-evolved unequal-time commutator bounds.
@@ -123,6 +131,13 @@ def compute_backward_bounds(
     corresponding terms will be used whenever a :class:`~qiskit.circuit.BoxOp` with a matching
     :class:`~samplomatic.InjectNoise` annotation is encountered during the iteration over
     ``circuit``.
+
+    .. important::
+      Every :class:`~qiskit.circuit.BoxOp` with an :class:`~samplomatic.InjectNoise` annotation
+      **must** have a unique ``modifier_ref``, since the bounds are keyed by it. Boxing a circuit
+      with :func:`~samplomatic.transpiler.generate_boxing_pass_manager` provides this only with
+      ``inject_noise_strategy="individual_modification"``. Otherwise, this function may never
+      return.
 
     .. caution::
       Before computing the bounds, this function removes **all** :class:`.Measure` operations from
@@ -146,7 +161,7 @@ def compute_backward_bounds(
     circuit = remove_measure(circuit).inverse()
 
     norm_fn = partial(
-        _time_evolved_norm_backward,
+        time_evolved_norm_backward,
         evolution_max_terms=evolution_max_terms,
     )
 
