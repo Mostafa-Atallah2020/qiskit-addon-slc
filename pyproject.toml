@@ -96,7 +96,7 @@ show_missing = true
 
 [tool.maturin]
 bindings = "pyo3"
-python-source = "."
+python-source = "python"
 features = ["pyo3/extension-module"]
 locked = true
 profile = "release"
@@ -117,12 +117,11 @@ skip = [
     "*-musllinux_*",
 ]
 test-extras = ["test"]
-# `--import-mode=importlib` because `tests/` is a package: in the default `prepend` mode pytest puts
-# the source checkout on `sys.path`, and its `qiskit_addon_slc/` (which has no compiled extension)
-# then shadows the installed wheel. Passing the test path explicitly also makes pytest ignore
-# `[tool.pytest.ini_options].testpaths`, so the doctests under `qiskit_addon_slc/` are not collected
-# (`-p no:doctest`); those stay owned by `test_latest_versions.yml`.
-test-command = "python -m pytest --import-mode=importlib -p no:doctest {project}/tests"
+# Passing the test path explicitly makes pytest ignore `[tool.pytest.ini_options].testpaths`, so the
+# doctests under `python/qiskit_addon_slc/` are not collected (`-p no:doctest`): they need the
+# source tree, and stay owned by `test_latest_versions.yml`. `{project}` qualifies the path because
+# cibuildwheel runs the test command from its own scratch directory.
+test-command = "python -m pytest -p no:doctest {project}/tests"
 environment = 'RUSTUP_TOOLCHAIN="stable"'
 
 [tool.cibuildwheel.linux]
@@ -166,11 +165,11 @@ enable = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["./qiskit_addon_slc/", "./tests/"]
+testpaths = ["./python/qiskit_addon_slc/", "./tests/"]
 
 [tool.ruff]
 line-length = 100
-src = ["qiskit_addon_slc", "tests"]
+src = ["python/qiskit_addon_slc", "tests"]
 target-version = "py310"
 
 [tool.ruff.lint]

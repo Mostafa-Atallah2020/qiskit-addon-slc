@@ -12,7 +12,7 @@ Most workflows here are _reusable_: they only have a `workflow_call` trigger and
 
 Most jobs are guarded by `github.repository_owner == 'Qiskit'`, so they skip on forks.
 
-The package contains a Rust extension (`qiskit_addon_slc._accelerate`, built by [maturin](https://www.maturin.rs/)), so every job that installs it first installs a stable Rust toolchain and restores the cargo registry cache, keyed on `Cargo.lock`.  The test, coverage and documentation jobs also run `pip install --no-deps -e .` before tox: pytest (for the doctests under `qiskit_addon_slc/`) and Sphinx's autodoc import the package from the source tree, which shadows the wheel that tox installs, and the editable install puts the compiled extension into that tree.
+The package contains a Rust extension (`qiskit_addon_slc._accelerate`, built by [maturin](https://www.maturin.rs/)), so every job that installs it first installs a stable Rust toolchain and restores the cargo registry cache, keyed on `Cargo.lock`.  The package source lives under `python/`, so tests and documentation builds import the wheel that tox installs; only the doctest and coverage environments use an editable install (see `tox.ini`).
 
 ## Required checks (called by `branch-protection.yml`)
 

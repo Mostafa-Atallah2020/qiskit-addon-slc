@@ -62,15 +62,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install tox
 
-      # pytest (for the doctests under `qiskit_addon_slc/`) and Sphinx's autodoc both import the package
-      # from the source tree, which shadows the wheel that tox installs.  An editable install drops the
-      # compiled `_accelerate` extension into that tree so the shadowing copy can import it too.
-      # `--no-deps` because this is only after the extension: the environments get their dependencies
-      # from tox.
-      - name: Build the Rust extension in place
-        run: |
-          pip install --no-deps -e .
-
       - name: Test using tox environment
         shell: bash
         run: |
