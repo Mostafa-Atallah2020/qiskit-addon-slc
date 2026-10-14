@@ -17,6 +17,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import qiskit_addon_slc.utils.davidson as davidson
+import scipy.sparse
 from qiskit.quantum_info import PauliList, SparsePauliOp
 from qiskit_addon_slc.utils.davidson import get_extremal_eigenvalue
 
@@ -129,28 +130,79 @@ def test_iterative_path_converges_on_hard_operator() -> None:
     assert np.isclose(eigval, _dense_min(spo), atol=1e-9)
 
 
+def _solve(matrix, seed=None, *, indptr=None, indices=None, data=None, **options):
+    """Call the Rust solver directly on a dense ``matrix``, optionally replacing its CSR arrays."""
+    csr = scipy.sparse.csr_matrix(np.asarray(matrix, dtype=np.complex128))
+    options = {"tol": 1e-10, "max_cycle": 500, "max_space": 12, "lindep": 1e-11} | options
+    return davidson._accelerate.davidson_smallest(
+        csr.indptr.astype(np.int64) if indptr is None else np.asarray(indptr, dtype=np.int64),
+        csr.indices.astype(np.int64) if indices is None else np.asarray(indices, dtype=np.int64),
+        csr.data if data is None else np.asarray(data, dtype=np.complex128),
+        davidson._initial_guess(csr.shape[0]) if seed is None else np.asarray(seed, np.complex128),
+        **options,
+    )
+
+
 def test_solver_converges_on_diagonal_matrix() -> None:
     """The Rust solver converges on a diagonal matrix, where plain Jacobi corrections vanish."""
-    dim = 8
-    diag = np.arange(-4, 4, dtype=float)
-    seed = davidson._initial_guess((dim,))
-    converged, eigval = davidson._accelerate.davidson_smallest(
-        np.arange(dim + 1, dtype=np.int64),
-        np.arange(dim, dtype=np.int64),
-        diag,
-        np.zeros(dim),
-        diag.copy(),
-        np.zeros(dim),
-        np.ascontiguousarray(seed.real),
-        np.ascontiguousarray(seed.imag),
-        dim,
-        1e-10,
-        500,
-        12,
-        1e-11,
-    )
+    converged, eigval = _solve(np.diag(np.arange(-4, 4, dtype=float)))
     assert converged
     assert np.isclose(eigval, -4.0, atol=1e-10)
+
+
+def test_solver_normalizes_seed() -> None:
+    """The result does not depend on the norm of the start vector."""
+    matrix = np.diag(np.arange(-4, 4, dtype=float)) + 0.1 * (np.eye(8, k=1) + np.eye(8, k=-1))
+    seed = davidson._initial_guess(8)
+    expected = _solve(matrix, seed)
+    assert expected[0]
+    assert np.isclose(expected[1], np.linalg.eigvalsh(matrix)[0], atol=1e-10)
+    for scale in (2.0, 1e-8, 1e8):
+        converged, eigval = _solve(matrix, scale * seed)
+        assert converged
+        assert np.isclose(eigval, expected[1], atol=1e-10)
+
+
+def test_solver_converges_at_tiny_tolerance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``tol`` far below the rounding noise of the operator still converges."""
+    monkeypatch.setattr(davidson, "_MAX_REDUCED_LOG2_DIM", 1)
+    spo = SparsePauliOp(["XII", "ZII", "IXX", "IZZ"], [1.0, 0.5, -0.3, 0.8])
+    converged, eigval = get_extremal_eigenvalue(spo, tol=1e-18)
+    assert converged
+    assert np.isclose(eigval, _dense_min(spo), atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"seed": np.zeros(4)}, "`seed` must be non-zero and finite"),
+        ({"seed": [1, np.nan, 0, 0]}, "`seed` must be non-zero and finite"),
+        ({"seed": np.ones(3)}, "`seed` must have length"),
+        ({"indptr": [1, 2, 3, 4, 4]}, r"`indptr\[0\]` must be 0"),
+        ({"indptr": [0, 2, 1, 3, 4]}, "`indptr` must be non-decreasing"),
+        ({"indptr": [0]}, "`indptr` must have at least two entries"),
+        ({"indptr": [0, 1, 2, 3, 3]}, "must both have length `indptr"),
+        ({"indices": [0, 1, 2, 4]}, "`indices` entries must be in"),
+        ({"indices": [0, 1, 2, -1]}, "`indices` entries must be in"),
+        ({"data": [1, 2, 3, np.inf]}, "`data` entries must be finite"),
+        ({"data": [1, 2, 3]}, "must both have length `indptr"),
+        ({"tol": 0.0}, "`tol` must be positive and finite"),
+        ({"max_space": 1}, "`max_space` must be at least 2"),
+        ({"lindep": 1.0}, r"`lindep` must be in `\[0, 1\)`"),
+    ],
+)
+def test_solver_rejects_invalid_input(kwargs: dict, match: str) -> None:
+    """Inconsistent arrays or out-of-range options raise instead of being silently misread."""
+    with pytest.raises(ValueError, match=match):
+        _solve(np.diag([1.0, 2.0, 3.0, 4.0]), **kwargs)
+
+
+def test_extra_kwargs_are_deprecated() -> None:
+    """Keyword arguments once forwarded to PySCF are ignored, with a deprecation warning."""
+    spo = SparsePauliOp(["XI", "ZI", "IZ"], [0.7, -0.4, 1.1])
+    with pytest.warns(DeprecationWarning, match="Ignoring: follow_state, nroots"):
+        converged, eigval = get_extremal_eigenvalue(spo, nroots=1, follow_state=True)
+    assert (converged, eigval) == get_extremal_eigenvalue(spo)
 
 
 @pytest.mark.parametrize("seed", range(40))

@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import warnings
-from typing import cast
 
 import numpy as np
 from qiskit.quantum_info import PauliList, SparsePauliOp
@@ -94,18 +93,22 @@ def get_extremal_eigenvalue(
         lindep: the fraction of its squared norm below which a new subspace vector, after being
             orthogonalized against the existing subspace, is considered linearly dependent on it
             (and, thus, discarded).
-        kwargs: **ignored!** Any additional keyword arguments are parsed for backwards compatibility
-            but do not have any effect at runtime and, thus, are being ignored!
+        kwargs: **deprecated and ignored.** Additional keyword arguments used to be passed on to the
+            ``pyscf.lib.davidson1`` solver that this function no longer uses. They are still accepted
+            for backwards compatibility, but have no effect and raise a ``DeprecationWarning``.
 
     Returns:
         A ``(converged, eigenvalue)`` pair. ``converged`` reports whether the computation succeeded
         (may be ``False`` if Davidson fails to converge). ``eigenvalue`` is the most-negative
         eigenvalue of ``spo``.
     """
-    if len(kwargs) > 0:
+    if kwargs:
         warnings.warn(
-            f"These keyword arguments do not have any effect and are ignored: {kwargs}",
-            category=UserWarning,
+            "Passing additional keyword arguments to get_extremal_eigenvalue() is deprecated as of "
+            "qiskit-addon-slc 0.2.0 and will be removed no sooner than 3 months after the release "
+            "date. They used to be passed on to pyscf.lib.davidson1, which is no longer used, and "
+            f"have no effect. Ignoring: {', '.join(sorted(kwargs))}.",
+            category=DeprecationWarning,
             stacklevel=2,
         )
 
@@ -168,49 +171,35 @@ def _davidson_extremal_eigenvalue(
     The default ``tol`` is tight because the eigenvalue error runs well above ``tol`` (roughly
     ``tol`` divided by the spectral gap, which is small for these near-degenerate commutators).
     """
-    spmat = spo.to_matrix(sparse=True, force_serial=True).tocsr()
-    dim = spmat.shape[0]
-    data = spmat.data.astype(np.complex128)
-    diag = spmat.diagonal().astype(np.complex128)
-    seed = _initial_guess((dim,)).astype(np.complex128)
-
+    spmat = spo.to_matrix(sparse=True, force_serial=True)  # already CSR
+    # The solver borrows these arrays, so only convert (and copy) those not yet in its format.
     return _accelerate.davidson_smallest(
-        spmat.indptr.astype(np.int64),
-        spmat.indices.astype(np.int64),
-        np.ascontiguousarray(data.real),
-        np.ascontiguousarray(data.imag),
-        np.ascontiguousarray(diag.real),
-        np.ascontiguousarray(diag.imag),
-        np.ascontiguousarray(seed.real),
-        np.ascontiguousarray(seed.imag),
-        dim,
-        float(tol),
-        int(max_cycle),
-        int(max_space),
-        float(lindep),
+        np.ascontiguousarray(spmat.indptr, dtype=np.int64),
+        np.ascontiguousarray(spmat.indices, dtype=np.int64),
+        np.ascontiguousarray(spmat.data, dtype=np.complex128),
+        _initial_guess(spmat.shape[0]),
+        tol=float(tol),
+        max_cycle=int(max_cycle),
+        max_space=int(max_space),
+        lindep=float(lindep),
     )
 
 
-def _initial_guess(shape: tuple[int, ...]) -> np.ndarray:
-    """Produces a deterministic normalized starting vector of the requested shape.
+def _initial_guess(dim: int) -> np.ndarray:
+    """Produces a deterministic normalized starting vector of length ``dim``.
 
-    A fixed-seed local generator is used so that the
-    Davidson iteration is reproducible: the same operator always yields the same result, independent
-    of any surrounding random state. A pseudo-random (rather than constant) vector is used to avoid
-    initial guesses that are accidentally orthogonal to the target eigenvector.
+    A fixed-seed local generator is used so that the Davidson iteration is reproducible: the same
+    operator always yields the same result, independent of any surrounding random state. A
+    pseudo-random (rather than constant) vector is used to avoid initial guesses that are
+    accidentally orthogonal to the target eigenvector.
 
     Args:
-        shape: the requested shape.
+        dim: the length of the vector.
 
     Returns:
-        A unit-norm array of complex values with their real and imaginary parts lying in the interval
-        ``[0, 1)``.
+        A unit-norm complex vector, whose real and imaginary parts are drawn uniformly from ``[0, 1)``
+        before normalization.
     """
     rng = np.random.default_rng(0)
-
-    norm = 0.0
-    while norm == 0:
-        x = rng.random(shape[0]) + 1.0j * rng.random(shape[0])
-        norm = cast(float, np.linalg.norm(x))
-
-    return x / norm
+    x = rng.random(dim) + 1.0j * rng.random(dim)
+    return x / float(np.linalg.norm(x))

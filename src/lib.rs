@@ -17,13 +17,14 @@
 //! sparse-times-dense multiplication for complex scalars.
 //!
 //! Each cycle takes the smallest Ritz pair `(θ, x)` of the subspace. A Ritz pair is a convergence
-//! candidate when its value has settled (`|Δθ| < tol`) and its residual `A·x - θ·x` has norm below
-//! the gate `max(tol, 64·ε·max(‖A‖, 1))`. The `ε‖A‖` term keeps the gate reachable at a tiny `tol`,
-//! since a converged eigenvector still leaves a residual on that order, while the `tol` term keeps
-//! accuracy tracking the request when `tol` dominates. `‖A‖` is estimated by the maximum absolute row
-//! sum. If the next subspace vector turns out linearly dependent on the subspace (no more than a
-//! `lindep` fraction of its squared norm survives orthogonalization, as in `pyscf.lib.davidson1`), the
-//! subspace is exhausted, and the same residual gate decides whether `(θ, x)` is a candidate.
+//! candidate when both the change of its value since the previous cycle and the norm of its residual
+//! `A·x - θ·x` lie below the gate `max(tol, 64·ε·max(‖A‖, 1))`. The `ε‖A‖` term keeps the gate
+//! reachable at a tiny `tol`, since a converged eigenvector still leaves a residual, and its Ritz value
+//! still fluctuates, on that order, while the `tol` term keeps accuracy tracking the request when `tol`
+//! dominates. `‖A‖` is estimated by the maximum absolute row sum. If the next subspace vector turns
+//! out linearly dependent on the subspace (no more than a `lindep` fraction of its squared norm
+//! survives orthogonalization, as in `pyscf.lib.davidson1`), the subspace is exhausted, and the
+//! residual gate alone decides whether `(θ, x)` is a candidate.
 //!
 //! A candidate shows only that `(θ, x)` is *an* eigenpair, not the smallest one, and the
 //! preconditioner pulls towards the eigenvalue nearest `θ`. Before accepting it, a short Lanczos
@@ -48,37 +49,83 @@ use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-/// A Hermitian operator held in compressed-sparse-row form.
-struct CsrOp {
-    indptr: Vec<i64>,
-    indices: Vec<i64>,
-    data: Vec<C64>,
+/// A Hermitian operator held in compressed-sparse-row form, borrowing the caller's arrays.
+///
+/// Only [`CsrOp::new`] constructs it, after checking that the arrays form a valid CSR matrix, so the
+/// index casts below cannot go out of bounds.
+struct CsrOp<'a> {
+    indptr: &'a [i64],
+    indices: &'a [i64],
+    data: &'a [C64],
     dim: usize,
 }
 
-impl CsrOp {
+impl<'a> CsrOp<'a> {
+    /// Validates the CSR arrays of a square `dim x dim` matrix, where `dim = indptr.len() - 1`.
+    fn new(indptr: &'a [i64], indices: &'a [i64], data: &'a [C64]) -> PyResult<Self> {
+        let dim = indptr.len().saturating_sub(1);
+        if dim == 0 {
+            return Err(PyValueError::new_err(
+                "`indptr` must have at least two entries",
+            ));
+        }
+        if indptr[0] != 0 {
+            return Err(PyValueError::new_err("`indptr[0]` must be 0"));
+        }
+        // Together with `indptr[0] == 0` this also makes every entry non-negative.
+        if !indptr.windows(2).all(|w| w[0] <= w[1]) {
+            return Err(PyValueError::new_err("`indptr` must be non-decreasing"));
+        }
+        if indices.len() != data.len() || indptr[dim] as u64 != indices.len() as u64 {
+            return Err(PyValueError::new_err(
+                "`indices` and `data` must both have length `indptr[-1]`",
+            ));
+        }
+        if indices.iter().any(|&j| j < 0 || j as u64 >= dim as u64) {
+            return Err(PyValueError::new_err(
+                "`indices` entries must be in `[0, len(indptr) - 1)`",
+            ));
+        }
+        if !data.iter().all(|z| z.is_finite()) {
+            return Err(PyValueError::new_err("`data` entries must be finite"));
+        }
+        Ok(Self {
+            indptr,
+            indices,
+            data,
+            dim,
+        })
+    }
+
+    /// The index range into `indices` and `data` of the entries of `row`.
+    fn row(&self, row: usize) -> std::ops::Range<usize> {
+        self.indptr[row] as usize..self.indptr[row + 1] as usize
+    }
+
     /// Returns `self @ x`.
     fn apply(&self, x: &DVector<C64>) -> DVector<C64> {
-        let mut y = DVector::zeros(self.dim);
-        for row in 0..self.dim {
-            let mut acc = C64::default();
-            for k in self.indptr[row] as usize..self.indptr[row + 1] as usize {
-                acc += self.data[k] * x[self.indices[k] as usize];
-            }
-            y[row] = acc;
-        }
-        y
+        DVector::from_fn(self.dim, |row, _| {
+            self.row(row)
+                .map(|k| self.data[k] * x[self.indices[k] as usize])
+                .sum()
+        })
+    }
+
+    /// Returns the diagonal, summing duplicate entries as `scipy.sparse` does.
+    fn diagonal(&self) -> DVector<C64> {
+        DVector::from_fn(self.dim, |row, _| {
+            self.row(row)
+                .filter(|&k| self.indices[k] as usize == row)
+                .map(|k| self.data[k])
+                .sum()
+        })
     }
 
     /// Maximum absolute row sum, the induced infinity-norm, which for a Hermitian operator upper
     /// bounds the spectral radius. Used as a cheap operator-scale estimate.
     fn norm_bound(&self) -> f64 {
         (0..self.dim)
-            .map(|row| {
-                (self.indptr[row] as usize..self.indptr[row + 1] as usize)
-                    .map(|k| self.data[k].norm())
-                    .sum::<f64>()
-            })
+            .map(|row| self.row(row).map(|k| self.data[k].norm()).sum::<f64>())
             .fold(0.0_f64, f64::max)
     }
 }
@@ -104,10 +151,10 @@ fn columns_to_matrix(cols: &[DVector<C64>]) -> DMatrix<C64> {
     DMatrix::from_columns(&cols.iter().map(|c| c.column(0)).collect::<Vec<_>>())
 }
 
-/// Iterates for the algebraically smallest eigenvalue of `op`, returning `(converged, eigenvalue)`.
+/// Iterates for the algebraically smallest eigenvalue of `op` from the unit vector `seed`, returning
+/// `(converged, eigenvalue)`.
 fn davidson(
     op: &CsrOp,
-    diag: &DVector<C64>,
     seed: DVector<C64>,
     tol: f64,
     max_cycle: usize,
@@ -116,13 +163,16 @@ fn davidson(
 ) -> (bool, f64) {
     let dim = op.dim;
 
+    let diag = op.diagonal();
     let diag_scale = diag.iter().map(|z| z.norm()).fold(0.0_f64, f64::max);
     let precondition = diag_scale > 0.0;
     let floor = 1e-12 * diag_scale.max(1.0);
 
-    // Residual gate relative to the operator scale (see the module documentation).
+    // Residual and eigenvalue-change gates relative to the operator scale (see the module
+    // documentation). Both share the floor, since the Ritz value of a converged vector still
+    // fluctuates by rounding errors on the order of `ε‖A‖` between cycles.
     let anorm = op.norm_bound();
-    let residual_tol = tol.max(64.0 * f64::EPSILON * anorm.max(1.0));
+    let gate = tol.max(64.0 * f64::EPSILON * anorm.max(1.0));
 
     // Subspace basis vectors `s` and their images `A @ s`, grown one vector per cycle, together with
     // the Rayleigh-Ritz projection `sᴴ A s`, which is extended by one row and column per new vector
@@ -137,7 +187,7 @@ fn davidson(
 
     // A Lanczos Ritz value has to undercut the converged one by more than rounding noise before it
     // counts as evidence of a lower eigenvalue (see `lower_ritz_vector`).
-    let verify_margin = residual_tol.max(1e3 * f64::EPSILON * anorm.max(1.0));
+    let verify_margin = gate.max(1e3 * f64::EPSILON * anorm.max(1.0));
     let mut rng = SplitMix64(0x5eed);
 
     for _ in 0..max_cycle {
@@ -156,7 +206,7 @@ fn davidson(
         let de = (theta - prev).abs();
         prev = theta;
 
-        let correction = if residual_norm < residual_tol && de < tol {
+        let correction = if residual_norm < gate && de < gate {
             // A small residual only shows that `(θ, x)` is *an* eigenpair. The preconditioner pulls
             // towards the eigenvalue nearest `θ`, so the iteration can settle on an interior one,
             // which would understate the norm. Accept only if no lower eigenvalue turns up.
@@ -221,7 +271,7 @@ fn davidson(
             Some(next) => next,
             // The subspace is exhausted. A converged estimate still has to pass the same check
             // for a lower eigenvalue, whose approximation then extends the subspace instead.
-            None if residual_norm < residual_tol => {
+            None if residual_norm < gate => {
                 match lower_ritz_vector(op, &ritz, theta - verify_margin, anorm, &mut rng) {
                     None => {
                         converged = true;
@@ -351,75 +401,52 @@ impl SplitMix64 {
     }
 }
 
-/// Python entry point: builds a [`CsrOp`] from the split real/imaginary arrays and runs [`davidson`].
+/// Python entry point: runs [`davidson`] on the Hermitian CSR matrix `(data, indices, indptr)`
+/// (`scipy.sparse.csr_matrix` order) from the start vector `seed`, which is normalized here.
 ///
-/// Raises `ValueError` if the CSR arrays, `dim`, `diag`, or `seed` are inconsistent.
+/// The arrays are borrowed, not copied, so they must be C-contiguous. Raises `ValueError` if they do
+/// not form a valid CSR matrix, if `seed` does not match it or is zero or non-finite, or if a solver
+/// option is out of range.
 #[pyfunction]
+#[pyo3(signature = (indptr, indices, data, seed, *, tol, max_cycle, max_space, lindep))]
 #[allow(clippy::too_many_arguments)]
 fn davidson_smallest(
     indptr: PyReadonlyArray1<i64>,
     indices: PyReadonlyArray1<i64>,
-    data_re: PyReadonlyArray1<f64>,
-    data_im: PyReadonlyArray1<f64>,
-    diag_re: PyReadonlyArray1<f64>,
-    diag_im: PyReadonlyArray1<f64>,
-    seed_re: PyReadonlyArray1<f64>,
-    seed_im: PyReadonlyArray1<f64>,
-    dim: usize,
+    data: PyReadonlyArray1<C64>,
+    seed: PyReadonlyArray1<C64>,
     tol: f64,
     max_cycle: usize,
     max_space: usize,
     lindep: f64,
 ) -> PyResult<(bool, f64)> {
-    fn to_complex(re: &[f64], im: &[f64]) -> Vec<C64> {
-        re.iter().zip(im).map(|(a, b)| C64::new(*a, *b)).collect()
+    let op = CsrOp::new(indptr.as_slice()?, indices.as_slice()?, data.as_slice()?)?;
+
+    let seed = seed.as_slice()?;
+    if seed.len() != op.dim {
+        return Err(PyValueError::new_err(
+            "`seed` must have length `len(indptr) - 1`",
+        ));
     }
+    let mut seed = DVector::from_column_slice(seed);
+    let seed_norm = seed.norm();
+    if !(seed_norm.is_finite() && seed_norm > 0.0) {
+        return Err(PyValueError::new_err("`seed` must be non-zero and finite"));
+    }
+    // Rayleigh-Ritz and the orthogonalizations assume an orthonormal basis, starting with `seed`.
+    seed.unscale_mut(seed_norm);
 
-    let indptr = indptr.as_slice()?;
-    let indices = indices.as_slice()?;
-    let data = to_complex(data_re.as_slice()?, data_im.as_slice()?);
-    let diag = to_complex(diag_re.as_slice()?, diag_im.as_slice()?);
-    let seed = to_complex(seed_re.as_slice()?, seed_im.as_slice()?);
-
-    if dim == 0 {
-        return Err(PyValueError::new_err("`dim` must be positive"));
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(PyValueError::new_err("`tol` must be positive and finite"));
     }
     if max_space < 2 {
         return Err(PyValueError::new_err("`max_space` must be at least 2"));
     }
-    if indptr.len() != dim + 1 {
-        return Err(PyValueError::new_err("`indptr` must have length `dim + 1`"));
-    }
-    if !indptr.windows(2).all(|w| w[0] <= w[1]) {
-        return Err(PyValueError::new_err("`indptr` must be non-decreasing"));
-    }
-    if indptr[dim] as usize != indices.len() || indices.len() != data.len() {
-        return Err(PyValueError::new_err(
-            "`indptr[dim]` must equal `indices.len()` and `data.len()`",
-        ));
-    }
-    if indices.iter().any(|&j| j < 0 || j as usize >= dim) {
-        return Err(PyValueError::new_err(
-            "`indices` entries must be in `[0, dim)`",
-        ));
-    }
-    if diag.len() != dim || seed.len() != dim {
-        return Err(PyValueError::new_err(
-            "`diag` and `seed` must have length `dim`",
-        ));
+    if !(0.0..1.0).contains(&lindep) {
+        return Err(PyValueError::new_err("`lindep` must be in `[0, 1)`"));
     }
 
-    let op = CsrOp {
-        indptr: indptr.to_vec(),
-        indices: indices.to_vec(),
-        data,
-        dim,
-    };
-    let diag = DVector::from_vec(diag);
-    let seed = DVector::from_vec(seed);
-
-    let (conv, ev) = davidson(&op, &diag, seed, tol, max_cycle, max_space, lindep);
-    Ok((conv, ev))
+    Ok(davidson(&op, seed, tol, max_cycle, max_space, lindep))
 }
 
 #[pymodule]

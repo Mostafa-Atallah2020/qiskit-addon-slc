@@ -15,3 +15,11 @@ upgrade:
     :func:`~qiskit_addon_slc.utils.davidson.get_extremal_eigenvalue` was
     previously provided by ``pyscf``, which had no Windows wheel and could not be
     built from source on Windows; it is now the compiled Rust extension.
+deprecations:
+  - |
+    Passing arbitrary keyword arguments to
+    :func:`~qiskit_addon_slc.utils.davidson.get_extremal_eigenvalue` is
+    deprecated. They used to be forwarded to ``pyscf.lib.davidson1``; now they
+    are ignored and raise a ``DeprecationWarning``. The options that the new
+    solver supports, ``tol``, ``max_cycle``, ``max_space`` and ``lindep``, are
+    explicit keyword arguments instead.
