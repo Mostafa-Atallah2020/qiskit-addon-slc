@@ -211,14 +211,15 @@ fn davidson(
             // towards the eigenvalue nearest `θ`, so the iteration can settle on an interior one,
             // which would understate the norm. Accept only if no lower eigenvalue turns up.
             match lower_ritz_vector(op, &ritz, theta - verify_margin, anorm, &mut rng) {
-                None => {
+                Verification::NoLower => {
                     converged = true;
                     break;
                 }
-                Some(lower) => {
+                Verification::Lower(lower) => {
                     prev = f64::INFINITY;
                     lower
                 }
+                Verification::Inconclusive => break,
             }
         } else if precondition {
             // Apply the preconditioner, flooring the shift while keeping its sign.
@@ -273,11 +274,11 @@ fn davidson(
             // for a lower eigenvalue, whose approximation then extends the subspace instead.
             None if residual_norm < gate => {
                 match lower_ritz_vector(op, &ritz, theta - verify_margin, anorm, &mut rng) {
-                    None => {
+                    Verification::NoLower => {
                         converged = true;
                         break;
                     }
-                    Some(lower) => match orthonormalize(&s_mat, lower, lindep) {
+                    Verification::Lower(lower) => match orthonormalize(&s_mat, lower, lindep) {
                         Some(next) => {
                             prev = f64::INFINITY;
                             next
@@ -285,6 +286,7 @@ fn davidson(
                         // A lower eigenvalue exists but cannot be pursued: report non-convergence.
                         None => break,
                     },
+                    Verification::Inconclusive => break,
                 }
             }
             None => break,
@@ -323,21 +325,40 @@ fn orthonormalize(basis: &DMatrix<C64>, v: DVector<C64>, lindep: f64) -> Option<
 /// Number of Lanczos steps [`lower_ritz_vector`] takes.
 const VERIFY_STEPS: usize = 20;
 
+/// Number of pseudo-random start vectors [`lower_ritz_vector`] tries before giving up.
+const VERIFY_START_ATTEMPTS: usize = 3;
+
+/// Outcome of [`lower_ritz_vector`].
+enum Verification {
+    /// No eigenvalue below the threshold turned up.
+    NoLower,
+    /// An eigenvalue below the threshold exists; this is the matching Lanczos Ritz vector.
+    Lower(DVector<C64>),
+    /// The check could not run, as every start vector was numerically dependent on `x`.
+    Inconclusive,
+}
+
 /// Looks for an eigenvalue of `op` below `threshold` with a short Lanczos iteration from a
 /// pseudo-random start vector, kept orthogonal to the converged Ritz vector `x`. Unlike the
 /// preconditioned Davidson correction, Lanczos is not biased towards any part of the spectrum, so its
-/// lowest Ritz value quickly approaches the smallest eigenvalue in the complement of `x`. Returns the
-/// matching Ritz vector if that value lies below `threshold`, and `None` otherwise.
+/// lowest Ritz value quickly approaches the smallest eigenvalue in the complement of `x`.
 fn lower_ritz_vector(
     op: &CsrOp,
     x: &DVector<C64>,
     threshold: f64,
     anorm: f64,
     rng: &mut SplitMix64,
-) -> Option<DVector<C64>> {
+) -> Verification {
+    if op.dim == 1 {
+        return Verification::NoLower; // `x` spans the whole space
+    }
     let x_mat = DMatrix::from_columns(&[x.column(0)]);
-    let start = DVector::from_fn(op.dim, |_, _| C64::new(rng.next_f64(), rng.next_f64()));
-    let mut v = orthonormalize(&x_mat, start, f64::EPSILON)?;
+    let Some(mut v) = (0..VERIFY_START_ATTEMPTS).find_map(|_| {
+        let start = DVector::from_fn(op.dim, |_, _| C64::new(rng.next_f64(), rng.next_f64()));
+        orthonormalize(&x_mat, start, f64::EPSILON)
+    }) else {
+        return Verification::Inconclusive;
+    };
 
     let mut basis: Vec<DVector<C64>> = Vec::new();
     let mut alphas: Vec<f64> = Vec::new();
@@ -374,7 +395,11 @@ fn lower_ritz_vector(
         C64::new(value, 0.0)
     });
     let (values, vectors) = ritz_pairs(&tridiagonal);
-    (values[0] < threshold).then(|| columns_to_matrix(&basis) * vectors.column(0))
+    if values[0] < threshold {
+        Verification::Lower(columns_to_matrix(&basis) * vectors.column(0))
+    } else {
+        Verification::NoLower
+    }
 }
 
 /// Orthogonalizes `v` against the orthonormal columns of `basis` (classical Gram-Schmidt with one

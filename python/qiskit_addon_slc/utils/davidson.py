@@ -26,13 +26,16 @@ from qiskit.quantum_info import PauliList, SparsePauliOp
 from .. import _accelerate
 from .reduce_op import _reduce_operator
 
-# Largest ``p + c`` (log2 of the reduced-operator size) handled by dense diagonalization; above this
-# the reduced operator is solved with iterative Davidson instead. Dense ``eigvalsh`` computes the
-# whole spectrum in ``O((2^(p+c))^3)`` when only the smallest eigenvalue is needed, so it is only
-# worth it while that is cheap: ``p + c = 8`` is a single 256x256 solve (~10ms). Beyond this,
-# iterative (which targets just the extremal eigenvalue via sparse matvecs) is far faster -- e.g. a
-# generic ``p + c = 12`` operator takes ~50s dense vs a fraction of a second iterative.
-_MAX_REDUCED_LOG2_DIM = 8
+# Largest ``p`` (log2 of the size of each of the ``2^c`` diagonal blocks of the reduced operator) for
+# which the blocks are diagonalized exactly; above this the reduced operator is solved with
+# iterative Davidson instead. The exact path costs ``O(2^c * (2^p)^3)``. For random 40-term
+# operators of up to 14 qubits it beat Davidson for every ``p <= 8`` (e.g. ``p = 8, c = 6`` took
+# ~0.3s against ~1.5s), while Davidson took over from ``p = 9`` or ``10``.
+_MAX_SECTOR_LOG2_DIM = 8
+
+# Upper bound on the number of matrix entries (16 bytes each) of the diagonal blocks that the exact
+# path holds in memory at once; the sectors are processed in chunks below it.
+_MAX_SECTOR_CHUNK_ENTRIES = 1 << 20
 
 
 def get_extremal_eigenvalue(
@@ -55,11 +58,13 @@ def get_extremal_eigenvalue(
 
     This exploits how a sum of Paulis lives in a space of dimension ``2^(p + c)``, where ``p`` is the
     number of independent anticommuting pairs the Paulis generate and ``c`` counts the remaining
-    commuting directions. When this reduced operator is small enough it is diagonalized densely,
-    giving a result exact to machine precision. Otherwise, the reduced operator is instead solved
-    with the compiled Rust Davidson solver (a diagonally-preconditioned Davidson iteration, which
-    checks a converged eigenvalue with a short Lanczos iteration for a lower one before reporting
-    it). This path is accurate but not exact, and the arguments below affect only it.
+    commuting directions. The commuting directions are conserved, so this reduced operator is
+    block-diagonal, with ``2^c`` blocks of size ``2^p``. When these blocks are small enough each is
+    diagonalized exactly, giving a result exact to machine precision. Otherwise, the reduced
+    operator is instead solved with the compiled Rust Davidson solver (a diagonally-preconditioned
+    Davidson iteration, which checks a converged eigenvalue with a short Lanczos iteration for a
+    lower one before reporting it). This path is accurate but not exact, and the arguments below
+    affect only it.
 
     Note the sign convention: the returned eigenvalue is the most-negative one, so the spectral norm
     is its absolute value.
@@ -101,7 +106,21 @@ def get_extremal_eigenvalue(
         A ``(converged, eigenvalue)`` pair. ``converged`` reports whether the computation succeeded
         (may be ``False`` if Davidson fails to converge). ``eigenvalue`` is the most-negative
         eigenvalue of ``spo``.
+
+    Raises:
+        ValueError: if ``tol`` is not positive and finite, ``max_cycle`` is not positive,
+            ``max_space`` is less than 2, or ``lindep`` is not in ``[0, 1)``. These are checked for
+            every ``spo``, even one that is solved exactly.
     """
+    if not (np.isfinite(tol) and tol > 0):
+        raise ValueError(f"tol must be positive and finite, got {tol}.")
+    if max_cycle < 1:
+        raise ValueError(f"max_cycle must be positive, got {max_cycle}.")
+    if max_space < 2:
+        raise ValueError(f"max_space must be at least 2, got {max_space}.")
+    if not 0 <= lindep < 1:
+        raise ValueError(f"lindep must be in [0, 1), got {lindep}.")
+
     if kwargs:
         warnings.warn(
             "Passing additional keyword arguments to get_extremal_eigenvalue() is deprecated as of "
@@ -124,8 +143,8 @@ def get_extremal_eigenvalue(
         # sparse build stays O(2^c) in memory (only c <= eigval_max_qubits reaches here).
         diagonal = reduced_op.to_matrix(sparse=True, force_serial=True).diagonal()
         result = True, float(diagonal.real.min())
-    elif reduced_op.num_qubits > _MAX_REDUCED_LOG2_DIM:
-        # Large, with anticommuting pairs -> hand the whole operator to Davidson.
+    elif p > _MAX_SECTOR_LOG2_DIM:
+        # Large blocks: hand the whole operator to Davidson.
         result = _davidson_extremal_eigenvalue(
             reduced_op,
             tol=tol,
@@ -134,28 +153,45 @@ def get_extremal_eigenvalue(
             lindep=lindep,
         )
     else:
-        # Small: reduced_op is block-diagonal over the 2^c commuting-Z sectors. Diagonalize the
-        # p-qubit block in each sector and take the overall minimum. A term's sign in a sector is -1
-        # to the parity of the trailing Z's (commuting generators) it carries.
-        paulis = reduced_op.paulis
-        commuting_gen_mask = paulis.z[:, p:]  # (K, c)
-        sector_bits = ((np.arange(1 << c)[:, None] >> np.arange(c)) & 1).astype(
-            np.uint8
-        )  # (2^c, c)
-        parity = (sector_bits @ commuting_gen_mask.T.astype(np.uint8)) & 1  # (2^c, K)
-        sector_sign = np.where(parity, np.int8(-1), np.int8(1))  # (2^c, K)
-        block = SparsePauliOp(
-            PauliList.from_symplectic(paulis.z[:, :p], paulis.x[:, :p]), reduced_op.coeffs
-        )
-        base_coeffs = block.coeffs.copy()
-        lowest = np.inf
-        for signs in sector_sign:
-            block.coeffs = base_coeffs * signs
-            mat = block.to_matrix(force_serial=True)  # serial: this runs inside a process pool
-            lowest = min(lowest, float(np.linalg.eigvalsh(mat)[0]))
-        result = True, lowest
+        result = True, _sector_minimum(reduced_op, p, c)
 
     return result
+
+
+def _sector_minimum(reduced_op: SparsePauliOp, p: int, c: int) -> float:
+    """Exact smallest eigenvalue of a reduced operator, block by block.
+
+    ``reduced_op`` is block-diagonal over the ``2^c`` sign sectors of its trailing commuting ``Z``
+    generators. In each sector, a term acts on the ``p`` leading qubits with its coefficient
+    multiplied by ``-1`` to the parity of the trailing ``Z``'s it carries. This builds the blocks of
+    many sectors at once and diagonalizes them as a batch, keeping the overall minimum.
+    """
+    paulis = reduced_op.paulis
+    dim = 1 << p
+    # A p-qubit Pauli is a phased permutation matrix, with exactly one entry per row; record each
+    # term's column and value per row. Serial: this runs inside a process pool.
+    block_paulis = PauliList.from_symplectic(paulis.z[:, :p], paulis.x[:, :p])
+    rows = np.arange(dim)
+    cols = np.empty((len(block_paulis), dim), dtype=np.intp)
+    vals = np.empty((len(block_paulis), dim), dtype=np.complex128)
+    for k, pauli in enumerate(block_paulis):
+        mat = pauli.to_matrix(sparse=True)
+        cols[k] = mat.indices
+        vals[k] = mat.data
+
+    generators = paulis.z[:, p:].astype(np.int64)  # (K, c)
+    sectors_per_chunk = max(1, _MAX_SECTOR_CHUNK_ENTRIES // (dim * dim))
+    lowest = np.inf
+    for start in range(0, 1 << c, sectors_per_chunk):
+        sectors = np.arange(start, min(start + sectors_per_chunk, 1 << c))
+        bits = (sectors[:, None] >> np.arange(c)) & 1  # (S, c)
+        signs = 1 - 2 * ((bits @ generators.T) & 1)  # (S, K)
+        coeffs = signs * reduced_op.coeffs  # (S, K)
+        blocks = np.zeros((len(sectors), dim, dim), dtype=np.complex128)
+        for k in range(len(block_paulis)):
+            blocks[:, rows, cols[k]] += coeffs[:, k, None] * vals[k]
+        lowest = min(lowest, float(np.linalg.eigvalsh(blocks)[:, 0].min()))
+    return lowest
 
 
 def _davidson_extremal_eigenvalue(
@@ -168,8 +204,9 @@ def _davidson_extremal_eigenvalue(
 ) -> tuple[bool, float]:
     """Iterative Davidson fallback, dispatched to the compiled Rust solver.
 
-    The default ``tol`` is tight because the eigenvalue error runs well above ``tol`` (roughly
-    ``tol`` divided by the spectral gap, which is small for these near-degenerate commutators).
+    The options are those of :func:`get_extremal_eigenvalue`, whose default ``tol`` is tight because
+    the eigenvalue error runs well above ``tol`` (roughly ``tol`` divided by the spectral gap, which
+    is small for these near-degenerate commutators).
     """
     spmat = spo.to_matrix(sparse=True, force_serial=True)  # already CSR
     # The solver borrows these arrays, so only convert (and copy) those not yet in its format.
