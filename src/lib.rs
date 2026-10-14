@@ -16,20 +16,31 @@
 //! whose matrix-vector product is applied directly, because `nalgebra-sparse` does not implement
 //! sparse-times-dense multiplication for complex scalars.
 //!
-//! The stopping rule mirrors `pyscf.lib.davidson1`. A cycle converges when the Ritz value has settled
-//! (`|Δθ| < tol`) and the residual `A·x - θ·x` of the current Ritz pair `(θ, x)` has norm below the
-//! gate `max(tol, 64·ε·max(‖A‖, 1))`. The `ε‖A‖` term keeps the gate reachable at a tiny `tol`, since
-//! a converged eigenvector still leaves a residual on that order, while the `tol` term keeps accuracy
-//! tracking the request when `tol` dominates. `‖A‖` is estimated by the maximum absolute row sum. If
-//! the correction vanishes after orthogonalization the subspace is exhausted, and that same residual
-//! test then decides convergence, as in `davidson1` (`conv = dx_norm < toloose`).
+//! Each cycle takes the smallest Ritz pair `(θ, x)` of the subspace. A Ritz pair is a convergence
+//! candidate when its value has settled (`|Δθ| < tol`) and its residual `A·x - θ·x` has norm below
+//! the gate `max(tol, 64·ε·max(‖A‖, 1))`. The `ε‖A‖` term keeps the gate reachable at a tiny `tol`,
+//! since a converged eigenvector still leaves a residual on that order, while the `tol` term keeps
+//! accuracy tracking the request when `tol` dominates. `‖A‖` is estimated by the maximum absolute row
+//! sum. If the next subspace vector turns out linearly dependent on the subspace (no more than a
+//! `lindep` fraction of its squared norm survives orthogonalization, as in `pyscf.lib.davidson1`), the
+//! subspace is exhausted, and the same residual gate decides whether `(θ, x)` is a candidate.
 //!
-//! The Jacobi preconditioner divides each correction entry by the shift `diag[i] - θ`. A shift whose
+//! A candidate shows only that `(θ, x)` is *an* eigenpair, not the smallest one, and the
+//! preconditioner pulls towards the eigenvalue nearest `θ`. Before accepting it, a short Lanczos
+//! iteration orthogonal to `x` looks for a lower eigenvalue. If it finds one, its Ritz vector joins
+//! the subspace and the iteration continues. This matters because the caller turns the eigenvalue
+//! into an upper bound on a norm, which an interior eigenvalue would understate.
+//!
+//! The correction is Olsen's variant of the Jacobi-preconditioned residual, `M⁻¹r - ε·M⁻¹x` with `ε`
+//! chosen to make it orthogonal to `x`, where `M` is the diagonal of `A - θ`. Each entry of `M` whose
 //! magnitude falls below `floor = 1e-12 * max(diag_scale, 1)`, where `diag_scale` is the largest
 //! `|diag[i]|`, is clamped up to `floor`, keeping its sign so it is not pushed the wrong way. This
 //! floor is relative to the operator scale rather than to `tol`, because `tol` is a residual
 //! threshold and clamping to it would corrupt operators with a near-zero diagonal. When the diagonal
-//! is entirely zero the preconditioner has no useful shift to apply, so it is skipped altogether.
+//! is entirely zero the preconditioner has no useful shift to apply, so the plain residual is used.
+//!
+//! Before the subspace exceeds `max_space` vectors it is restarted from its lowest `max_space / 2`
+//! Ritz vectors.
 
 use nalgebra::{DMatrix, DVector};
 use num_complex::Complex64 as C64;
@@ -72,17 +83,20 @@ impl CsrOp {
     }
 }
 
-/// Diagonalizes the small `k x k` Hermitian Rayleigh-Ritz matrix, returning the smallest eigenvalue
-/// and its eigenvector.
-fn smallest_eigenpair(projected: &DMatrix<C64>) -> (f64, DVector<C64>) {
+/// Diagonalizes the small `k x k` Hermitian Rayleigh-Ritz matrix, returning its eigenvalues in
+/// ascending order together with the matching eigenvectors as columns.
+fn ritz_pairs(projected: &DMatrix<C64>) -> (Vec<f64>, DMatrix<C64>) {
     let eig = projected.clone().symmetric_eigen();
-    let mut best = 0;
-    for i in 1..eig.eigenvalues.len() {
-        if eig.eigenvalues[i] < eig.eigenvalues[best] {
-            best = i;
-        }
-    }
-    (eig.eigenvalues[best], eig.eigenvectors.column(best).into())
+    let mut order: Vec<usize> = (0..eig.eigenvalues.len()).collect();
+    order.sort_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]));
+    let values = order.iter().map(|&i| eig.eigenvalues[i]).collect();
+    let vectors = DMatrix::from_columns(
+        &order
+            .iter()
+            .map(|&i| eig.eigenvectors.column(i))
+            .collect::<Vec<_>>(),
+    );
+    (values, vectors)
 }
 
 /// Stacks a set of column vectors into a dense matrix.
@@ -110,71 +124,231 @@ fn davidson(
     let anorm = op.norm_bound();
     let residual_tol = tol.max(64.0 * f64::EPSILON * anorm.max(1.0));
 
-    // Subspace basis vectors `s` and their images `A @ s`, grown one vector per cycle.
+    // Subspace basis vectors `s` and their images `A @ s`, grown one vector per cycle, together with
+    // the Rayleigh-Ritz projection `sᴴ A s`, which is extended by one row and column per new vector
+    // rather than recomputed, so a cycle costs `O(dim·k)` instead of `O(dim·k²)`.
     let mut images: Vec<DVector<C64>> = vec![op.apply(&seed)];
+    let mut projected = DMatrix::from_element(1, 1, C64::new(seed.dotc(&images[0]).re, 0.0));
     let mut s: Vec<DVector<C64>> = vec![seed];
 
     let mut converged = false;
     let mut eigval = 0.0f64;
     let mut prev = f64::INFINITY;
 
+    // A Lanczos Ritz value has to undercut the converged one by more than rounding noise before it
+    // counts as evidence of a lower eigenvalue (see `lower_ritz_vector`).
+    let verify_margin = residual_tol.max(1e3 * f64::EPSILON * anorm.max(1.0));
+    let mut rng = SplitMix64(0x5eed);
+
     for _ in 0..max_cycle {
         let s_mat = columns_to_matrix(&s);
         let images_mat = columns_to_matrix(&images);
 
-        // Rayleigh-Ritz: project the operator onto the subspace and Hermitize.
-        let projected = s_mat.adjoint() * &images_mat;
-        let projected = (&projected + projected.adjoint()).scale(0.5);
-        let (theta, y) = smallest_eigenpair(&projected);
+        let (thetas, ys) = ritz_pairs(&projected);
+        let theta = thetas[0];
         eigval = theta;
 
-        let ritz = &s_mat * &y;
-        let ritz_image = &images_mat * &y;
+        let ritz = &s_mat * ys.column(0);
+        let ritz_image = &images_mat * ys.column(0);
         let residual = &ritz_image - ritz.scale(theta);
 
         let residual_norm = residual.norm();
         let de = (theta - prev).abs();
         prev = theta;
-        if residual_norm < residual_tol && de < tol {
-            converged = true;
-            break;
-        }
 
-        // Apply the preconditioner, flooring the shift while keeping its sign.
-        let mut correction = residual;
-        if precondition {
-            for i in 0..dim {
-                let mut d = diag[i] - C64::new(theta, 0.0);
-                if d.norm() < floor {
-                    let sign = if d.re < 0.0 { -floor } else { floor };
-                    d = C64::new(sign, 0.0);
+        let correction = if residual_norm < residual_tol && de < tol {
+            // A small residual only shows that `(θ, x)` is *an* eigenpair. The preconditioner pulls
+            // towards the eigenvalue nearest `θ`, so the iteration can settle on an interior one,
+            // which would understate the norm. Accept only if no lower eigenvalue turns up.
+            match lower_ritz_vector(op, &ritz, theta - verify_margin, anorm, &mut rng) {
+                None => {
+                    converged = true;
+                    break;
                 }
-                correction[i] /= d;
+                Some(lower) => {
+                    prev = f64::INFINITY;
+                    lower
+                }
             }
-        }
+        } else if precondition {
+            // Apply the preconditioner, flooring the shift while keeping its sign.
+            let precondition_vec = |v: &DVector<C64>| {
+                DVector::from_fn(dim, |i, _| {
+                    let mut d = diag[i] - C64::new(theta, 0.0);
+                    if d.norm() < floor {
+                        let sign = if d.re < 0.0 { -floor } else { floor };
+                        d = C64::new(sign, 0.0);
+                    }
+                    v[i] / d
+                })
+            };
+            // Olsen's correction: subtract the multiple of `M⁻¹x` that makes the correction
+            // orthogonal to `x`. Plain `M⁻¹r` reproduces `x` itself wherever `M` matches `A - θ`
+            // (e.g. on diagonal blocks), so the new direction vanishes and the iteration stalls.
+            let m_r = precondition_vec(&residual);
+            let m_x = precondition_vec(&ritz);
+            let denom = ritz.dotc(&m_x);
+            if denom.norm() > f64::EPSILON * m_x.norm() {
+                &m_r - m_x * (ritz.dotc(&m_r) / denom)
+            } else {
+                m_r
+            }
+        } else {
+            residual
+        };
 
-        // Collapse the subspace to the current best estimate before it exceeds `max_space`.
+        // Thick restart: before the subspace exceeds `max_space`, shrink it to its lowest Ritz
+        // vectors. Keeping several of them, rather than only the current estimate, retains the
+        // components along the neighbouring eigenvectors; dropping those made the iteration stall,
+        // or settle on an interior eigenvalue when the ground state had been projected out. Their
+        // images follow from the same combination, so restarting costs no matrix-vector products,
+        // and in the basis of Ritz vectors the projection is just the diagonal of their values.
         if s.len() >= max_space {
-            s = vec![ritz.clone()];
-            images = vec![ritz_image];
+            let keep = (max_space / 2).max(1);
+            let kept = ys.columns(0, keep);
+            let s_new = &s_mat * kept;
+            let images_new = &images_mat * kept;
+            s = s_new.column_iter().map(|c| c.into_owned()).collect();
+            images = images_new.column_iter().map(|c| c.into_owned()).collect();
+            projected = DMatrix::from_diagonal(&DVector::from_iterator(
+                keep,
+                thetas[..keep].iter().map(|&t| C64::new(t, 0.0)),
+            ));
         }
 
-        // Classical Gram-Schmidt with one re-orthogonalization pass (numerically comparable to MGS).
         let s_mat = columns_to_matrix(&s);
-        correction -= &s_mat * (s_mat.adjoint() * &correction);
-        correction -= &s_mat * (s_mat.adjoint() * &correction);
-        let cnorm = correction.norm();
-        if cnorm < lindep {
-            converged = residual_norm < residual_tol;
-            break;
-        }
-        correction.unscale_mut(cnorm);
+        let next = match orthonormalize(&s_mat, correction, lindep) {
+            Some(next) => next,
+            // The subspace is exhausted. A converged estimate still has to pass the same check
+            // for a lower eigenvalue, whose approximation then extends the subspace instead.
+            None if residual_norm < residual_tol => {
+                match lower_ritz_vector(op, &ritz, theta - verify_margin, anorm, &mut rng) {
+                    None => {
+                        converged = true;
+                        break;
+                    }
+                    Some(lower) => match orthonormalize(&s_mat, lower, lindep) {
+                        Some(next) => {
+                            prev = f64::INFINITY;
+                            next
+                        }
+                        // A lower eigenvalue exists but cannot be pursued: report non-convergence.
+                        None => break,
+                    },
+                }
+            }
+            None => break,
+        };
 
-        images.push(op.apply(&correction));
-        s.push(correction);
+        let image = op.apply(&next);
+        let k = s.len();
+        projected = projected.resize(k + 1, k + 1, C64::default());
+        for (j, sj) in s.iter().enumerate() {
+            let entry = sj.dotc(&image);
+            projected[(j, k)] = entry;
+            projected[(k, j)] = entry.conj();
+        }
+        projected[(k, k)] = C64::new(next.dotc(&image).re, 0.0);
+        images.push(image);
+        s.push(next);
     }
 
     (converged, eigval)
+}
+
+/// Orthogonalizes `v` against the orthonormal columns of `basis` and normalizes it. Returns `None` when
+/// `v` is linearly dependent on `basis`, i.e. when no more than a `lindep` fraction of its squared
+/// norm survives the orthogonalization (the criterion of `pyscf.lib.davidson1`).
+fn orthonormalize(basis: &DMatrix<C64>, v: DVector<C64>, lindep: f64) -> Option<DVector<C64>> {
+    let before = v.norm();
+    let mut v = orthogonalized(basis, v);
+    let after = v.norm();
+    if after * after <= lindep * before * before {
+        return None;
+    }
+    v.unscale_mut(after);
+    Some(v)
+}
+
+/// Number of Lanczos steps [`lower_ritz_vector`] takes.
+const VERIFY_STEPS: usize = 20;
+
+/// Looks for an eigenvalue of `op` below `threshold` with a short Lanczos iteration from a
+/// pseudo-random start vector, kept orthogonal to the converged Ritz vector `x`. Unlike the
+/// preconditioned Davidson correction, Lanczos is not biased towards any part of the spectrum, so its
+/// lowest Ritz value quickly approaches the smallest eigenvalue in the complement of `x`. Returns the
+/// matching Ritz vector if that value lies below `threshold`, and `None` otherwise.
+fn lower_ritz_vector(
+    op: &CsrOp,
+    x: &DVector<C64>,
+    threshold: f64,
+    anorm: f64,
+    rng: &mut SplitMix64,
+) -> Option<DVector<C64>> {
+    let x_mat = DMatrix::from_columns(&[x.column(0)]);
+    let start = DVector::from_fn(op.dim, |_, _| C64::new(rng.next_f64(), rng.next_f64()));
+    let mut v = orthonormalize(&x_mat, start, f64::EPSILON)?;
+
+    let mut basis: Vec<DVector<C64>> = Vec::new();
+    let mut alphas: Vec<f64> = Vec::new();
+    let mut betas: Vec<f64> = Vec::new();
+    let steps = VERIFY_STEPS.min(op.dim.saturating_sub(1)).max(1);
+    for step in 0..steps {
+        let w = op.apply(&v);
+        alphas.push(v.dotc(&w).re);
+        basis.push(v);
+        if step + 1 == steps {
+            break;
+        }
+        // Full re-orthogonalization against the Lanczos basis and `x`.
+        let mut against = basis.clone();
+        against.push(x.clone());
+        let w = orthogonalized(&columns_to_matrix(&against), w);
+        let beta = w.norm();
+        if beta <= 1e-12 * anorm.max(1.0) {
+            break; // invariant subspace: the Ritz values below are exact
+        }
+        betas.push(beta);
+        v = w.unscale(beta);
+    }
+
+    let k = alphas.len();
+    let tridiagonal = DMatrix::from_fn(k, k, |i, j| {
+        let value = if i == j {
+            alphas[i]
+        } else if i + 1 == j || j + 1 == i {
+            betas[i.min(j)]
+        } else {
+            0.0
+        };
+        C64::new(value, 0.0)
+    });
+    let (values, vectors) = ritz_pairs(&tridiagonal);
+    (values[0] < threshold).then(|| columns_to_matrix(&basis) * vectors.column(0))
+}
+
+/// Orthogonalizes `v` against the orthonormal columns of `basis` (classical Gram-Schmidt with one
+/// re-orthogonalization pass, numerically comparable to MGS).
+fn orthogonalized(basis: &DMatrix<C64>, mut v: DVector<C64>) -> DVector<C64> {
+    v -= basis * (basis.adjoint() * &v);
+    v -= basis * (basis.adjoint() * &v);
+    v
+}
+
+/// SplitMix64, a small deterministic generator for the start vectors of [`lower_ritz_vector`], so
+/// that results stay reproducible without pulling in a random-number crate.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    /// Returns the next value, uniform in `[0, 1)`.
+    fn next_f64(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
 }
 
 /// Python entry point: builds a [`CsrOp`] from the split real/imaginary arrays and runs [`davidson`].

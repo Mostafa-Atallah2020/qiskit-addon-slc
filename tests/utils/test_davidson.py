@@ -73,6 +73,110 @@ def test_iterative_path_matches_dense(monkeypatch: pytest.MonkeyPatch) -> None:
     assert np.isclose(eigval, _dense_min(spo), atol=1e-6)
 
 
+def _davidson(spo: SparsePauliOp, tol: float = 1e-10) -> tuple[bool, float]:
+    """Run the iterative solver directly on ``spo``, without the symplectic reduction."""
+    return davidson._davidson_extremal_eigenvalue(
+        spo, tol=tol, max_cycle=500, max_space=12, lindep=1e-11
+    )
+
+
+def test_iterative_path_rejects_interior_eigenvalue() -> None:
+    """A residual-converged interior eigenpair must not be reported as the smallest eigenvalue.
+
+    The Jacobi preconditioner pulls the iteration towards the eigenvalue nearest the current Ritz
+    value. On this operator it used to settle on the exact eigenpair at -4.685 and report it as
+    converged, understating the norm, while the smallest eigenvalue is -6.602.
+    """
+    spo = SparsePauliOp.from_list(
+        [
+            ("IIZIZII", -0.9584991779408014),
+            ("IZIIZII", 1.6669776941321173),
+            ("IZZZIZI", 1.2237204510824284),
+            ("ZZIIIZX", -0.3653449625439495),
+            ("ZZZZIII", -2.161505965703816),
+            ("ZZZZZZZ", -0.46508930674903803),
+        ]
+    )
+    converged, eigval = _davidson(spo, tol=1e-6)
+    assert converged
+    assert np.isclose(eigval, _dense_min(spo), atol=1e-6)
+
+
+def test_iterative_path_converges_on_hard_operator() -> None:
+    """The public API converges on an operator that takes the iterative path and used to stall.
+
+    The reduced operator has more than ``_MAX_REDUCED_LOG2_DIM`` qubits, so this needs no monkeypatch.
+    Restarting from a single Ritz vector and judging linear dependence on the unnormalized correction
+    made the iteration give up here, reporting ``converged=False``.
+    """
+    spo = SparsePauliOp.from_list(
+        [
+            ("ZIIZZIIXY", 1.34),
+            ("IZIZZIIIX", 0.3),
+            ("IZZZIZIIX", 1.73),
+            ("ZIZIIIIYI", -0.05),
+            ("IZIIZZIYY", 0.37),
+            ("ZZIZZIIZI", -1.17),
+            ("IZZZIZZXX", -1.91),
+            ("ZIIZZZIZI", 0.21),
+            ("ZZIIIIIXX", -1.05),
+            ("IZIZIIZXZ", 1.37),
+            ("ZZZIZZZIY", -0.3),
+        ]
+    )
+    converged, eigval = get_extremal_eigenvalue(spo)
+    assert converged
+    assert np.isclose(eigval, _dense_min(spo), atol=1e-9)
+
+
+def test_solver_converges_on_diagonal_matrix() -> None:
+    """The Rust solver converges on a diagonal matrix, where plain Jacobi corrections vanish."""
+    dim = 8
+    diag = np.arange(-4, 4, dtype=float)
+    seed = davidson._initial_guess((dim,))
+    converged, eigval = davidson._accelerate.davidson_smallest(
+        np.arange(dim + 1, dtype=np.int64),
+        np.arange(dim, dtype=np.int64),
+        diag,
+        np.zeros(dim),
+        diag.copy(),
+        np.zeros(dim),
+        np.ascontiguousarray(seed.real),
+        np.ascontiguousarray(seed.imag),
+        dim,
+        1e-10,
+        500,
+        12,
+        1e-11,
+    )
+    assert converged
+    assert np.isclose(eigval, -4.0, atol=1e-10)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_iterative_path_is_sound(seed: int) -> None:
+    """Whenever the iterative solver reports convergence, its eigenvalue is the smallest one.
+
+    The operators have the shape the reduction produces: ``p`` anticommuting pairs on the leading
+    qubits and commuting Z generators on the trailing ones. ``converged=False`` is allowed, since the
+    caller then falls back to the triangle inequality, but a wrong converged value would make the
+    bound unsound.
+    """
+    rng = np.random.default_rng(seed)
+    p, c = int(rng.integers(1, 6)), int(rng.integers(2, 6))
+    num_terms = int(rng.integers(6, 25))
+    z = np.zeros((num_terms, p + c), dtype=bool)
+    x = np.zeros((num_terms, p + c), dtype=bool)
+    z[:, :p] = rng.random((num_terms, p)) < 0.4
+    x[:, :p] = rng.random((num_terms, p)) < 0.4
+    z[:, p:] = rng.random((num_terms, c)) < 0.5
+    spo = SparsePauliOp(PauliList.from_symplectic(z, x), rng.standard_normal(num_terms)).simplify()
+    for tol in (1e-6, 1e-10):
+        converged, eigval = _davidson(spo, tol=tol)
+        if converged:
+            assert np.isclose(eigval, _dense_min(spo), atol=max(1e-6, 1e3 * tol))
+
+
 def test_large_diagonal_matches_dense() -> None:
     """A many-qubit fully-commuting (p == 0) operator takes the diagonal path and stays exact."""
     rng = np.random.default_rng(0)

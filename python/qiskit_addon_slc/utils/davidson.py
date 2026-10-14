@@ -58,8 +58,9 @@ def get_extremal_eigenvalue(
     number of independent anticommuting pairs the Paulis generate and ``c`` counts the remaining
     commuting directions. When this reduced operator is small enough it is diagonalized densely,
     giving a result exact to machine precision. Otherwise, the reduced operator is instead solved
-    with the compiled Rust Davidson solver (a diagonally-preconditioned Davidson iteration). This
-    path is accurate but not exact, and the arguments below affect only it.
+    with the compiled Rust Davidson solver (a diagonally-preconditioned Davidson iteration, which
+    checks a converged eigenvalue with a short Lanczos iteration for a lower one before reporting
+    it). This path is accurate but not exact, and the arguments below affect only it.
 
     Note the sign convention: the returned eigenvalue is the most-negative one, so the spectral norm
     is its absolute value.
@@ -84,11 +85,15 @@ def get_extremal_eigenvalue(
     Args:
         spo: the Hermitian operator whose most-negative eigenvalue (and hence spectral norm) to
             compute.
-        tol: the convergence threshold on the residual norm of the iterative solver.
+        tol: the convergence threshold of the iterative solver. It bounds the change of the
+            eigenvalue between iterations and, unless rounding errors at the scale of the operator
+            norm dominate, the residual norm of the eigenvector.
         max_cycle: the maximum number of iterations of the iterative solver.
-        max_space: the maximum size of the subspace built up by the iterative solver.
-        lindep: the threshold below which a new subspace vector is considered linearly dependent on
-            the existing subspace (and, thus, discarded).
+        max_space: the maximum size of the subspace built up by the iterative solver. Once reached,
+            the subspace is restarted from its ``max_space // 2`` lowest Ritz vectors.
+        lindep: the fraction of its squared norm below which a new subspace vector, after being
+            orthogonalized against the existing subspace, is considered linearly dependent on it
+            (and, thus, discarded).
         kwargs: **ignored!** Any additional keyword arguments are parsed for backwards compatibility
             but do not have any effect at runtime and, thus, are being ignored!
 
