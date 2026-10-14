@@ -118,6 +118,11 @@ skip = [
     "*-musllinux_*",
 ]
 test-extras = ["test"]
+# `qiskit-aer` (required by `pauli-prop`) publishes no CPython 3.14 wheel for Linux aarch64 (latest
+# 0.17.2), and building it from source fails in the manylinux container for lack of BLAS. This only
+# skips *testing* there: the wheel is the same `cp310-abi3` one that is tested on 3.10-3.13. Drop
+# this once a `qiskit-aer` release ships `cp314-manylinux_*_aarch64` wheels.
+test-skip = ["cp314-manylinux_aarch64"]
 # Passing the test path explicitly makes pytest ignore `[tool.pytest.ini_options].testpaths`, so the
 # doctests under `python/qiskit_addon_slc/` are not collected (`-p no:doctest`): they need the
 # source tree, and stay owned by `test_latest_versions.yml`. `{project}` qualifies the path because
