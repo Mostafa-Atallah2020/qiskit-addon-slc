@@ -64,7 +64,9 @@ def get_extremal_eigenvalue(
     operator is instead solved with the compiled Rust Davidson solver (a diagonally-preconditioned
     Davidson iteration, which checks a converged eigenvalue with a short Lanczos iteration for a
     lower one before reporting it). This path is accurate but not exact, and the arguments below
-    affect only it.
+    affect only it. It builds the whole ``2^(p + c)``-dimensional operator in sparse form and holds
+    a few vectors of that length, so its memory use grows with the qubit count of ``spo``; callers
+    are expected to bound it, as the bound computations do with ``eigval_max_qubits``.
 
     Note the sign convention: the returned eigenvalue is the most-negative one, so the spectral norm
     is its absolute value.
