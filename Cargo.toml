@@ -11,7 +11,9 @@ name = "_accelerate"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py311"] }
+# `extension-module` is enabled by maturin (see `[tool.maturin].features`), so that a plain
+# `cargo test` or `cargo clippy` still links against libpython.
+pyo3 = { version = "0.29.0", features = ["abi3-py311"] }
 numpy = "0.29"
 num-complex = "0.4"
 nalgebra = "0.35"
