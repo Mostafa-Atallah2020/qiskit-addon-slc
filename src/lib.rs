@@ -43,7 +43,7 @@
 //! Before the subspace exceeds `max_space` vectors it is restarted from its lowest `max_space / 2`
 //! Ritz vectors.
 
-use nalgebra::{DMatrix, DVector};
+use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use num_complex::Complex64 as C64;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
@@ -132,8 +132,16 @@ impl<'a> CsrOp<'a> {
 
 /// Diagonalizes the small `k x k` Hermitian Rayleigh-Ritz matrix, returning its eigenvalues in
 /// ascending order together with the matching eigenvectors as columns.
-fn ritz_pairs(projected: &DMatrix<C64>) -> (Vec<f64>, DMatrix<C64>) {
-    let eig = projected.clone().symmetric_eigen();
+///
+/// Returns `None` if `projected` holds a non-finite entry (an operator entry near the overflow
+/// threshold can produce one) or if the eigensolver does not converge, instead of handing NaN or
+/// infinity to an iteration that may not terminate.
+fn ritz_pairs(projected: &DMatrix<C64>) -> Option<(Vec<f64>, DMatrix<C64>)> {
+    if !projected.iter().all(|z| z.is_finite()) {
+        return None;
+    }
+    let max_niter = 1000 * projected.nrows().max(1);
+    let eig = SymmetricEigen::try_new(projected.clone(), f64::EPSILON, max_niter)?;
     let mut order: Vec<usize> = (0..eig.eigenvalues.len()).collect();
     order.sort_by(|&a, &b| eig.eigenvalues[a].total_cmp(&eig.eigenvalues[b]));
     let values = order.iter().map(|&i| eig.eigenvalues[i]).collect();
@@ -143,7 +151,7 @@ fn ritz_pairs(projected: &DMatrix<C64>) -> (Vec<f64>, DMatrix<C64>) {
             .map(|&i| eig.eigenvectors.column(i))
             .collect::<Vec<_>>(),
     );
-    (values, vectors)
+    Some((values, vectors))
 }
 
 /// Stacks a set of column vectors into a dense matrix.
@@ -194,7 +202,9 @@ fn davidson(
         let s_mat = columns_to_matrix(&s);
         let images_mat = columns_to_matrix(&images);
 
-        let (thetas, ys) = ritz_pairs(&projected);
+        let Some((thetas, ys)) = ritz_pairs(&projected) else {
+            break; // non-finite projection: report non-convergence
+        };
         let theta = thetas[0];
         eigval = theta;
 
@@ -394,7 +404,9 @@ fn lower_ritz_vector(
         };
         C64::new(value, 0.0)
     });
-    let (values, vectors) = ritz_pairs(&tridiagonal);
+    let Some((values, vectors)) = ritz_pairs(&tridiagonal) else {
+        return Verification::Inconclusive;
+    };
     if values[0] < threshold {
         Verification::Lower(columns_to_matrix(&basis) * vectors.column(0))
     } else {
@@ -431,11 +443,12 @@ impl SplitMix64 {
 ///
 /// The arrays are borrowed, not copied, so they must be C-contiguous. Raises `ValueError` if they do
 /// not form a valid CSR matrix, if `seed` does not match it or is zero or non-finite, or if a solver
-/// option is out of range.
+/// option is out of range. The solve itself runs with the GIL released.
 #[pyfunction]
 #[pyo3(signature = (indptr, indices, data, seed, *, tol, max_cycle, max_space, lindep))]
 #[allow(clippy::too_many_arguments)]
 fn davidson_smallest(
+    py: Python<'_>,
     indptr: PyReadonlyArray1<i64>,
     indices: PyReadonlyArray1<i64>,
     data: PyReadonlyArray1<C64>,
@@ -471,7 +484,9 @@ fn davidson_smallest(
         return Err(PyValueError::new_err("`lindep` must be in `[0, 1)`"));
     }
 
-    Ok(davidson(&op, seed, tol, max_cycle, max_space, lindep))
+    // The read-only borrows of the arrays keep them from being resized or freed meanwhile, and
+    // `op` only holds slices of them.
+    Ok(py.detach(|| davidson(&op, seed, tol, max_cycle, max_space, lindep)))
 }
 
 #[pymodule]

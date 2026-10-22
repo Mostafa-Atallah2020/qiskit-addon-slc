@@ -256,6 +256,14 @@ def test_invalid_options_raise_on_every_path(options: dict, match: str, name: st
         get_extremal_eigenvalue(DENSE_OPERATORS[name], **options)
 
 
+def test_solver_reports_overflow_as_non_convergence() -> None:
+    """Entries that overflow during the iteration end it unconverged instead of hanging or panicking."""
+    big = 1e308
+    matrix = np.array([[0.0, big, 0.0], [big, 0.0, big], [0.0, big, 0.0]])
+    converged, _ = _solve(matrix)
+    assert not converged
+
+
 def test_solver_handles_one_dimensional_matrix() -> None:
     """A 1x1 matrix converges to its entry, as there is no complement to search for lower ones."""
     converged, eigval = _solve([[-2.5]])
