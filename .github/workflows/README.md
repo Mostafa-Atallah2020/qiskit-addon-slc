@@ -58,7 +58,7 @@ Backports are opened by [Mergify](https://mergify.com/) for pull requests labele
 
 ### Wheel builds (`wheels-build.yml`, `wheels-pr.yml`)
 
-`wheels-build.yml` is a reusable workflow that builds the sdist and, with [cibuildwheel](https://cibuildwheel.pypa.io/), the binary wheels for Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows (x86_64).  The extension targets the stable ABI (`abi3-py310`), so each platform yields a single `cp310-abi3` wheel, which cibuildwheel tests under every supported Python.  Its configuration lives in `[tool.cibuildwheel]` in `pyproject.toml`.
+`wheels-build.yml` is a reusable workflow that builds the sdist and, with [cibuildwheel](https://cibuildwheel.pypa.io/), the binary wheels for Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows (x86_64).  The extension targets the stable ABI (`abi3-py311`), so each platform yields a single `cp311-abi3` wheel, which cibuildwheel tests under every supported Python.  Its configuration lives in `[tool.cibuildwheel]` in `pyproject.toml`.
 
 `wheels-pr.yml` runs it on a pull request labeled `ci: test wheels`, to check the wheel builds before a release.
 

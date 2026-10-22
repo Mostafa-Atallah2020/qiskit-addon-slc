@@ -102,8 +102,8 @@ locked = true
 profile = "release"
 module-name = "qiskit_addon_slc._accelerate"
 
-# The extension is built abi3 (`pyo3`'s `abi3-py310` feature in `Cargo.toml`), so cibuildwheel
-# collapses each platform down to a single `cp310-abi3` wheel, which it then tests under every
+# The extension is built abi3 (`pyo3`'s `abi3-py311` feature in `Cargo.toml`), so cibuildwheel
+# collapses each platform down to a single `cp311-abi3` wheel, which it then tests under every
 # supported Python.
 [tool.cibuildwheel]
 manylinux-x86_64-image = "manylinux_2_28"
@@ -119,7 +119,7 @@ skip = [
 test-extras = ["test"]
 # `qiskit-aer` (required by `pauli-prop`) publishes no CPython 3.14 wheel for Linux aarch64 (latest
 # 0.17.2), and building it from source fails in the manylinux container for lack of BLAS. This only
-# skips *testing* there: the wheel is the same `cp310-abi3` one that is tested on 3.10-3.13. Drop
+# skips *testing* there: the wheel is the same `cp311-abi3` one that is tested on 3.11-3.13. Drop
 # this once a `qiskit-aer` release ships `cp314-manylinux_*_aarch64` wheels.
 test-skip = ["cp314-manylinux_aarch64"]
 # Passing the test path explicitly makes pytest ignore `[tool.pytest.ini_options].testpaths`, so the
