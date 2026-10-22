@@ -155,8 +155,8 @@ fn ritz_pairs(projected: &DMatrix<C64>) -> Option<(Vec<f64>, DMatrix<C64>)> {
 }
 
 /// Stacks a set of column vectors into a dense matrix.
-fn columns_to_matrix(cols: &[DVector<C64>]) -> DMatrix<C64> {
-    DMatrix::from_columns(&cols.iter().map(|c| c.column(0)).collect::<Vec<_>>())
+fn columns_to_matrix<'a>(cols: impl IntoIterator<Item = &'a DVector<C64>>) -> DMatrix<C64> {
+    DMatrix::from_columns(&cols.into_iter().map(|c| c.column(0)).collect::<Vec<_>>())
 }
 
 /// Iterates for the algebraically smallest eigenvalue of `op` from the unit vector `seed`, returning
@@ -233,21 +233,19 @@ fn davidson(
             }
         } else if precondition {
             // Apply the preconditioner, flooring the shift while keeping its sign.
-            let precondition_vec = |v: &DVector<C64>| {
-                DVector::from_fn(dim, |i, _| {
-                    let mut d = diag[i] - C64::new(theta, 0.0);
-                    if d.norm() < floor {
-                        let sign = if d.re < 0.0 { -floor } else { floor };
-                        d = C64::new(sign, 0.0);
-                    }
-                    v[i] / d
-                })
-            };
+            let shift = DVector::from_fn(dim, |i, _| {
+                let d = diag[i] - C64::new(theta, 0.0);
+                if d.norm() < floor {
+                    C64::new(if d.re < 0.0 { -floor } else { floor }, 0.0)
+                } else {
+                    d
+                }
+            });
             // Olsen's correction: subtract the multiple of `M⁻¹x` that makes the correction
             // orthogonal to `x`. Plain `M⁻¹r` reproduces `x` itself wherever `M` matches `A - θ`
             // (e.g. on diagonal blocks), so the new direction vanishes and the iteration stalls.
-            let m_r = precondition_vec(&residual);
-            let m_x = precondition_vec(&ritz);
+            let m_r = residual.component_div(&shift);
+            let m_x = ritz.component_div(&shift);
             let denom = ritz.dotc(&m_x);
             if denom.norm() > f64::EPSILON * m_x.norm() {
                 &m_r - m_x * (ritz.dotc(&m_r) / denom)
@@ -264,7 +262,8 @@ fn davidson(
         // or settle on an interior eigenvalue when the ground state had been projected out. Their
         // images follow from the same combination, so restarting costs no matrix-vector products,
         // and in the basis of Ritz vectors the projection is just the diagonal of their values.
-        if s.len() >= max_space {
+        let restarted = s.len() >= max_space;
+        if restarted {
             let keep = (max_space / 2).max(1);
             let kept = ys.columns(0, keep);
             let s_new = &s_mat * kept;
@@ -277,11 +276,18 @@ fn davidson(
             ));
         }
 
-        let s_mat = columns_to_matrix(&s);
+        // Only a restart changes the basis since `s_mat` was stacked.
+        let s_mat = if restarted {
+            columns_to_matrix(&s)
+        } else {
+            s_mat
+        };
         let next = match orthonormalize(&s_mat, correction, lindep) {
             Some(next) => next,
-            // The subspace is exhausted. A converged estimate still has to pass the same check
-            // for a lower eigenvalue, whose approximation then extends the subspace instead.
+            // The subspace is exhausted, so no further cycle can move `θ`, and the change since
+            // the previous cycle says nothing: the residual gate alone applies. A converged
+            // estimate still has to pass the same check for a lower eigenvalue, whose
+            // approximation then extends the subspace instead.
             None if residual_norm < gate => {
                 match lower_ritz_vector(op, &ritz, theta - verify_margin, anorm, &mut rng) {
                     Verification::NoLower => {
@@ -382,9 +388,7 @@ fn lower_ritz_vector(
             break;
         }
         // Full re-orthogonalization against the Lanczos basis and `x`.
-        let mut against = basis.clone();
-        against.push(x.clone());
-        let w = orthogonalized(&columns_to_matrix(&against), w);
+        let w = orthogonalized(&columns_to_matrix(basis.iter().chain([x])), w);
         let beta = w.norm();
         if beta <= 1e-12 * anorm.max(1.0) {
             break; // invariant subspace: the Ritz values below are exact
